@@ -29,7 +29,7 @@ def test():
         frame_rate=10,
         audio_ch1=mic,
         audio_ch2=zero,
-        device="cpu"
+        device="cpu",
     )
 
     maai.start()
