@@ -149,6 +149,7 @@ class VapGPT(nn.Module):
         logits = self.vap_head(out["x"])
 
         probs = logits.softmax(dim=-1)
+        p_bins = self.objective.probs_speaker_bin_aggregate(probs, from_bin=0, to_bin=3)
 
         p_now = self.objective.probs_next_speaker_aggregate(
             probs,
@@ -163,12 +164,13 @@ class VapGPT(nn.Module):
         )
 
         # Get back to the CPU
+        p_bins = p_bins.to("cpu").tolist()[0][-1]
         p_now = p_now.to("cpu").tolist()[0][-1]
         p_future = p_future.to("cpu").tolist()[0][-1]
 
         vad1 = vad1.sigmoid().to("cpu").tolist()[0][-1][0]
         vad2 = vad2.sigmoid().to("cpu").tolist()[0][-1][0]
 
-        ret = {"p_now": p_now, "p_future": p_future, "vad": [vad1, vad2]}
+        ret = {"p_now": p_now, "p_future": p_future, "vad": [vad1, vad2], "p_bins": p_bins}
 
         return ret, new_cache
