@@ -171,8 +171,16 @@ def load_vap_model(mode: str, frame_rate: int, context_len_sec: float, language:
         else:
             supported_languages = ["jp"]
             raise ValueError(f"Invalid language: {language}. Mode {mode} supports languages are: {supported_languages}")
+
+    elif mode == "nod_para":
+        # nod_para mode uses local_model in Maai.__init__, not this function.
+        # If called here, it means the user forgot to pass local_model.
+        raise ValueError(
+            "nod_para mode requires a local checkpoint. "
+            "Pass local_model=<path_to_ckpt> and maai_checkpoint=<path_to_maai_ckpt> to Maai()."
+        )
     else:
-        supported_modes = ["vap", "vap_mc", "bc_2type", "nod"]
+        supported_modes = ["vap", "vap_mc", "bc_2type", "nod", "nod_para"]
         raise ValueError(f"Invalid mode: {mode}. Supported modes are: {supported_modes}")
 
     try:
@@ -515,6 +523,108 @@ def conv_bytearray_2_vapresult_nod(barr):
         'p_nod_short': p_nod_short,
         'p_nod_long': p_nod_long,
         'p_nod_long_p': p_nod_long_p
+    }
+    
+    return result_vap
+
+
+#
+# nod_para: VAP result -> Byte
+#
+def conv_vapresult_2_bytearray_nod_para(vap_result):
+    """Serialize nod_para result to bytes.
+    
+    Format:
+      t (float64)
+      x1 (len + float64[])
+      x2 (len + float64[])
+      p_nod (float64)
+      p_bc (float64)
+      nod_count_probs (len + float64[])
+      nod_range (float64)
+      nod_speed (float64)
+      p_swing_up (float64)
+      nod_swing_up_value (float64)
+    """
+    b = b''
+    b += struct.pack('<d', vap_result['t'])
+    
+    b += len(vap_result['x1']).to_bytes(4, BYTE_ORDER)
+    b += conv_floatarray_2_byte(vap_result['x1'])
+    
+    b += len(vap_result['x2']).to_bytes(4, BYTE_ORDER)
+    b += conv_floatarray_2_byte(vap_result['x2'])
+    
+    # Scalar values
+    b += struct.pack('<d', vap_result['p_nod'])
+    b += struct.pack('<d', vap_result['p_bc'])
+    
+    # Count probabilities (list of floats)
+    count_probs = vap_result['nod_count_probs']
+    b += len(count_probs).to_bytes(4, BYTE_ORDER)
+    b += conv_floatarray_2_byte(count_probs)
+    
+    b += struct.pack('<d', vap_result['nod_range'])
+    b += struct.pack('<d', vap_result['nod_speed'])
+    b += struct.pack('<d', vap_result['p_swing_up'])
+    b += struct.pack('<d', vap_result['nod_swing_up_value'])
+    
+    return b
+
+
+#
+# nod_para: Byte -> VAP result
+#
+def conv_bytearray_2_vapresult_nod_para(barr):
+    """Deserialize nod_para result from bytes."""
+    idx = 0
+    t = struct.unpack('<d', barr[idx:idx+8])[0]
+    idx += 8
+    
+    len_x1 = struct.unpack('<I', barr[idx:idx+4])[0]
+    idx += 4
+    x1 = conv_bytearray_2_floatarray(barr[idx:idx+8*len_x1])
+    idx += 8*len_x1
+    
+    len_x2 = struct.unpack('<I', barr[idx:idx+4])[0]
+    idx += 4
+    x2 = conv_bytearray_2_floatarray(barr[idx:idx+8*len_x2])
+    idx += 8*len_x2
+    
+    p_nod = struct.unpack('<d', barr[idx:idx+8])[0]
+    idx += 8
+    
+    p_bc = struct.unpack('<d', barr[idx:idx+8])[0]
+    idx += 8
+    
+    len_count = struct.unpack('<I', barr[idx:idx+4])[0]
+    idx += 4
+    nod_count_probs = conv_bytearray_2_floatarray(barr[idx:idx+8*len_count])
+    idx += 8*len_count
+    
+    nod_range = struct.unpack('<d', barr[idx:idx+8])[0]
+    idx += 8
+    
+    nod_speed = struct.unpack('<d', barr[idx:idx+8])[0]
+    idx += 8
+    
+    p_swing_up = struct.unpack('<d', barr[idx:idx+8])[0]
+    idx += 8
+    
+    nod_swing_up_value = struct.unpack('<d', barr[idx:idx+8])[0]
+    idx += 8
+
+    result_vap = {
+        't': t,
+        'x1': x1,
+        'x2': x2,
+        'p_nod': p_nod,
+        'p_bc': p_bc,
+        'nod_count_probs': nod_count_probs,
+        'nod_range': nod_range,
+        'nod_speed': nod_speed,
+        'p_swing_up': p_swing_up,
+        'nod_swing_up_value': nod_swing_up_value,
     }
     
     return result_vap

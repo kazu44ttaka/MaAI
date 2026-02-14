@@ -13,7 +13,8 @@ from .models.vap import VapGPT
 from .models.vap_bc import VapGPT_bc
 from .models.vap_bc_2type import VapGPT_bc_2type
 from .models.vap_nod import VapGPT_nod
-from .models.config import VapConfig
+from .models.vap_nod_para import VapGPT_nod_para
+from .models.config import VapConfig, NodParaConfig
 # from .models.vap_prompt import VapGPT_prompt
 
 class Maai():
@@ -40,6 +41,9 @@ class Maai():
         local_model = None,
         result_queue_maxsize: int = 10,
         print_process_time: bool = False,
+        # --- nod_para mode only ---
+        maai_checkpoint: str = None,
+        nod_para_conf: NodParaConfig = None,
     ):
 
         conf = VapConfig()
@@ -50,62 +54,110 @@ class Maai():
         #     conf.channel_layers = 2
         #     conf.cross_layers = 6
         #     conf.num_heads = 8
-        
-        if mode in ["vap", "vap_mc"]:
-            self.vap = VapGPT(conf)
-        
-        elif mode == "bc":
-            self.vap = VapGPT_bc(conf)
-        
-        elif mode == "bc_2type":
-            self.vap = VapGPT_bc_2type(conf)
-        
-        elif mode == "nod":
-            self.vap = VapGPT_nod(conf)
-        
-        elif mode == "vap_prompt":
-            from .models.vap_prompt import VapGPT_prompt
-            self.vap = VapGPT_prompt(conf)
-        
-        self.device = device
 
+        self.device = device
         if self.device not in ["cpu", "cuda"]:
             raise ValueError("Device must be 'cpu' or 'cuda'.")
-        
-        # Store the initial state of the model to check for unchanged parameters
-        initial_state_dict = {name: param.clone() for name, param in self.vap.named_parameters()}
 
-        if local_model is None:
-            sd = load_vap_model(mode, frame_rate, context_len_sec, lang, device, cache_dir, force_download)
+        # -------------------------------------------------------
+        # nod_para mode: MAAI encoder + nod parameter heads
+        # -------------------------------------------------------
+        if mode == "nod_para":
+            if local_model is None:
+                raise ValueError("nod_para mode requires local_model (path to PL checkpoint)")
+            if maai_checkpoint is None:
+                raise ValueError("nod_para mode requires maai_checkpoint (path to MAAI encoder checkpoint)")
+            if nod_para_conf is None:
+                nod_para_conf = NodParaConfig()
+
+            # Load PL checkpoint
+            print(f"Loading nod_para model from: {local_model}")
+            ckpt = torch.load(local_model, map_location="cpu")
+            sd = ckpt.get("state_dict", ckpt)
+            nod_param_stats = ckpt.get("nod_param_stats", {
+                'range_mean': 0.0, 'range_std': 1.0,
+                'speed_mean': 0.0, 'speed_std': 1.0,
+                'swing_up_mean': 0.0, 'swing_up_std': 1.0,
+            })
+            print(f"[nod_para] nod_param_stats: {nod_param_stats}")
+
+            # Create model
+            self.vap = VapGPT_nod_para(
+                conf=conf,
+                nod_para_conf=nod_para_conf,
+                nod_param_stats=nod_param_stats,
+            )
+
+            # Load MAAI encoder
+            self.vap.load_encoder(
+                maai_checkpoint=maai_checkpoint,
+                frame_hz=frame_rate,
+                lim_context_sec=context_len_sec,
+            )
+
+            # Load model weights (encoder weights will be overwritten by checkpoint)
+            keys = self.vap.load_state_dict(sd, strict=False)
+            print(f"[nod_para] load_state_dict result: {keys}")
+
+            self.nod_param_stats = nod_param_stats
+
+            self.vap.to(self.device)
+            self.vap = self.vap.eval()
+
+        # -------------------------------------------------------
+        # All other modes: CPC encoder
+        # -------------------------------------------------------
         else:
-            print("Loading model from local file:", local_model)
-            sd = torch.load(local_model, map_location="cpu")
-        
-        self.vap.load_encoder(cpc_model=cpc_model)
-        self.vap.load_state_dict(sd, strict=False)
+            if mode in ["vap", "vap_mc"]:
+                self.vap = VapGPT(conf)
 
-        # The downsampling parameters are not loaded by "load_state_dict"
-        self.vap.encoder1.downsample[1].weight = nn.Parameter(sd['encoder.downsample.1.weight'])
-        self.vap.encoder1.downsample[1].bias = nn.Parameter(sd['encoder.downsample.1.bias'])
-        self.vap.encoder1.downsample[2].ln.weight = nn.Parameter(sd['encoder.downsample.2.ln.weight'])
-        self.vap.encoder1.downsample[2].ln.bias = nn.Parameter(sd['encoder.downsample.2.ln.bias'])
-        
-        self.vap.encoder2.downsample[1].weight = nn.Parameter(sd['encoder.downsample.1.weight'])
-        self.vap.encoder2.downsample[1].bias = nn.Parameter(sd['encoder.downsample.1.bias'])
-        self.vap.encoder2.downsample[2].ln.weight = nn.Parameter(sd['encoder.downsample.2.ln.weight'])
-        self.vap.encoder2.downsample[2].ln.bias = nn.Parameter(sd['encoder.downsample.2.ln.bias'])
+            elif mode == "bc":
+                self.vap = VapGPT_bc(conf)
 
-        # Check for parameters that were not updated from their initial values
-        for name, param in self.vap.named_parameters():
-            if name in initial_state_dict:
-                if torch.equal(param.data, initial_state_dict[name].data):
-                    # Exclude encoder parameters that are loaded separately
-                    if not name.startswith('encoder.'):
-                        print(f"Warning: Parameter '{name}' was not updated from its initial value.")
+            elif mode == "bc_2type":
+                self.vap = VapGPT_bc_2type(conf)
 
-        self.vap.to(self.device)
-        self.vap = self.vap.eval()
-        
+            elif mode == "nod":
+                self.vap = VapGPT_nod(conf)
+
+            elif mode == "vap_prompt":
+                from .models.vap_prompt import VapGPT_prompt
+                self.vap = VapGPT_prompt(conf)
+
+            # Store the initial state of the model to check for unchanged parameters
+            initial_state_dict = {name: param.clone() for name, param in self.vap.named_parameters()}
+
+            if local_model is None:
+                sd = load_vap_model(mode, frame_rate, context_len_sec, lang, device, cache_dir, force_download)
+            else:
+                print("Loading model from local file:", local_model)
+                sd = torch.load(local_model, map_location="cpu")
+
+            self.vap.load_encoder(cpc_model=cpc_model)
+            self.vap.load_state_dict(sd, strict=False)
+
+            # The downsampling parameters are not loaded by "load_state_dict"
+            self.vap.encoder1.downsample[1].weight = nn.Parameter(sd['encoder.downsample.1.weight'])
+            self.vap.encoder1.downsample[1].bias = nn.Parameter(sd['encoder.downsample.1.bias'])
+            self.vap.encoder1.downsample[2].ln.weight = nn.Parameter(sd['encoder.downsample.2.ln.weight'])
+            self.vap.encoder1.downsample[2].ln.bias = nn.Parameter(sd['encoder.downsample.2.ln.bias'])
+
+            self.vap.encoder2.downsample[1].weight = nn.Parameter(sd['encoder.downsample.1.weight'])
+            self.vap.encoder2.downsample[1].bias = nn.Parameter(sd['encoder.downsample.1.bias'])
+            self.vap.encoder2.downsample[2].ln.weight = nn.Parameter(sd['encoder.downsample.2.ln.weight'])
+            self.vap.encoder2.downsample[2].ln.bias = nn.Parameter(sd['encoder.downsample.2.ln.bias'])
+
+            # Check for parameters that were not updated from their initial values
+            for name, param in self.vap.named_parameters():
+                if name in initial_state_dict:
+                    if torch.equal(param.data, initial_state_dict[name].data):
+                        # Exclude encoder parameters that are loaded separately
+                        if not name.startswith('encoder.'):
+                            print(f"Warning: Parameter '{name}' was not updated from its initial value.")
+
+            self.vap.to(self.device)
+            self.vap = self.vap.eval()
+
         self.mode = mode
         self.mic1 = audio_ch1
         self.mic2 = audio_ch2
@@ -121,14 +173,24 @@ class Maai():
         self.audio_context_len = int(self.audio_contenxt_lim_sec * self.frame_rate)
         
         self.sampling_rate = 16000
-        self.frame_contxt_padding = 320 # Independe from frame size
-        
-        # Frame size
-        # 10Hz -> 320 + 1600 samples
-        # 20Hz -> 320 + 800 samples
-        # 50Hz -> 320 + 320 samples
-        self.audio_frame_size = self.sampling_rate // self.frame_rate + self.frame_contxt_padding
-        
+
+        if mode == "nod_para":
+            # MAAI encoder: no padding needed; frame = samples per frame
+            self.frame_contxt_padding = 0
+            self.audio_frame_size = self.sampling_rate // self.frame_rate
+            # Full audio buffers for re-encoding
+            self.current_x1_audio_full = np.array([], dtype=np.float32)
+            self.current_x2_audio_full = np.array([], dtype=np.float32)
+            # Maximum audio buffer length in samples
+            self.max_audio_samples = int(self.audio_contenxt_lim_sec * self.sampling_rate)
+        else:
+            self.frame_contxt_padding = 320  # Independent from frame size
+            # Frame size
+            # 10Hz -> 320 + 1600 samples
+            # 20Hz -> 320 + 800 samples
+            # 50Hz -> 320 + 320 samples
+            self.audio_frame_size = self.sampling_rate // self.frame_rate + self.frame_contxt_padding
+
         self.current_x1_audio = []
         self.current_x2_audio = []
         
@@ -235,7 +297,103 @@ class Maai():
             pass
     
     def process(self, x1, x2):
+        if self.mode == "nod_para":
+            self._process_nod_para(x1, x2)
+        else:
+            self._process_default(x1, x2)
+
+    def _process_nod_para(self, x1, x2):
+        """Process audio for nod_para mode (MAAI encoder).
         
+        MAAI encoder is Transformer-based (stateless), so the full audio context
+        is re-encoded each frame. No KV cache is used for the encoder or GPT.
+        """
+        time_start = time.time()
+
+        # Accumulate audio
+        self.current_x1_audio_full = np.concatenate([self.current_x1_audio_full, x1])
+        self.current_x2_audio_full = np.concatenate([self.current_x2_audio_full, x2])
+
+        # Check if we have enough new audio for one frame
+        if len(self.current_x1_audio_full) < self.audio_frame_size:
+            return
+
+        # Trim to max context length
+        if len(self.current_x1_audio_full) > self.max_audio_samples:
+            self.current_x1_audio_full = self.current_x1_audio_full[-self.max_audio_samples:]
+        if len(self.current_x2_audio_full) > self.max_audio_samples:
+            self.current_x2_audio_full = self.current_x2_audio_full[-self.max_audio_samples:]
+
+        # Audio for result_dict (latest frame only)
+        samples_per_frame = self.sampling_rate // self.frame_rate
+        x1_dist = self.current_x1_audio_full[-samples_per_frame:]
+        x2_dist = self.current_x2_audio_full[-samples_per_frame:]
+
+        with torch.no_grad():
+            # Create tensors: (1, 1, T) for encode_audio
+            x1_ = torch.from_numpy(self.current_x1_audio_full.copy()).float().unsqueeze(0).unsqueeze(0)
+            x2_ = torch.from_numpy(self.current_x2_audio_full.copy()).float().unsqueeze(0).unsqueeze(0)
+
+            if self.device != 'cpu':
+                x1_ = x1_.to(self.device, non_blocking=True)
+                x2_ = x2_.to(self.device, non_blocking=True)
+
+            # Encode full audio context
+            e1, e2 = self.vap.encode_audio(x1_, x2_)
+
+            # Run GPT on all embeddings (no KV cache)
+            out, _ = self.vap.forward(e1, e2, cache=None)
+
+            # Build result dict
+            result_dict = {
+                "t": time.time(),
+                "x1": x1_dist.copy(),
+                "x2": x2_dist.copy(),
+                "p_nod": out["p_nod"],
+                "p_bc": out["p_bc"],
+                "nod_count_probs": out["nod_count_probs"],
+                "nod_range": out["nod_range"],
+                "nod_speed": out["nod_speed"],
+                "p_swing_up": out["p_swing_up"],
+                "nod_swing_up_value": out["nod_swing_up_value"],
+            }
+
+            self.last_result = result_dict
+
+            # Non-blocking put; if full, drop oldest and keep the newest result.
+            try:
+                self.result_dict_queue.put_nowait(result_dict)
+            except queue.Full:
+                try:
+                    _ = self.result_dict_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self.result_dict_queue.put_nowait(result_dict)
+                except queue.Full:
+                    pass
+
+            if self.print_process_time:
+                time_process = time.time() - time_start
+                self.list_process_time_context.append(time_process)
+
+                if len(self.list_process_time_context) > self.CALC_PROCESS_TIME_INTERVAL:
+                    ave_proc_time = np.mean(self.list_process_time_context)
+                    num_process_frame = len(self.list_process_time_context) / (time.time() - self.last_interval_time)
+                    self.last_interval_time = time.time()
+                    context_sec = len(self.current_x1_audio_full) / self.sampling_rate
+                    print(f'[{self.mode}] Average processing time: {ave_proc_time:.5f} [sec], '
+                          f'#process/sec: {num_process_frame:.3f}, context: {context_sec:.1f}s')
+                    self.list_process_time_context.clear()
+
+                self.process_time_abs = time.time()
+
+        # Remove processed frame samples, keep remainder for next frame
+        self.current_x1_audio_full = self.current_x1_audio_full[samples_per_frame:]
+        self.current_x2_audio_full = self.current_x2_audio_full[samples_per_frame:]
+
+    def _process_default(self, x1, x2):
+        """Process audio for CPC encoder modes (vap, nod, bc, etc.)."""
         time_start = time.time()
 
         # Initialize buffer if empty
@@ -243,9 +401,6 @@ class Maai():
             self.current_x1_audio = np.zeros(self.frame_contxt_padding, dtype=np.float32)
         if len(self.current_x2_audio) == 0:
             self.current_x2_audio = np.zeros(self.frame_contxt_padding, dtype=np.float32)
-        
-        # x1 = x1.astype(np.float32, copy=False)
-        # x2 = x2.astype(np.float32, copy=False)
 
         # Add to buffer
         self.current_x1_audio = np.concatenate([self.current_x1_audio, x1])
