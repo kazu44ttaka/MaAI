@@ -38,6 +38,8 @@ class Maai():
         force_download: bool = False,
         use_kv_cache: bool = True,
         local_model = None,
+        result_queue_maxsize: int = 10,
+        print_process_time: bool = False,
     ):
 
         conf = VapConfig()
@@ -150,7 +152,13 @@ class Maai():
         self.list_process_time_context = []
         self.last_interval_time = time.time()
 
-        self.result_dict_queue = queue.Queue()
+        # Bounded queue to avoid unbounded memory growth in long-running sessions.
+        # When full, we drop the oldest element and keep the latest (real-time friendly).
+        if result_queue_maxsize is None or int(result_queue_maxsize) <= 0:
+            self.result_dict_queue = queue.Queue()
+        else:
+            self.result_dict_queue = queue.Queue(maxsize=int(result_queue_maxsize))
+        self.last_result = None
 
         self.use_kv_cache = use_kv_cache
         self.vap_cache = None
@@ -158,6 +166,8 @@ class Maai():
         # Thread control
         self._stop_event = threading.Event()
         self._worker_thread = None
+
+        self.print_process_time = print_process_time
     
     def worker(self):
         
@@ -322,12 +332,14 @@ class Maai():
                 "vap": lambda: {
                     "p_now": out['p_now'],
                     "p_future": out['p_future'],
-                    "vad": out['vad']
+                    "vad": out['vad'],
+                    "p_bins": out['p_bins']
                 },
                 "vap_mc": lambda: {
                     "p_now": out['p_now'],
                     "p_future": out['p_future'],
-                    "vad": out['vad']
+                    "vad": out['vad'],
+                    "p_bins": out['p_bins']
                 },
                 "vap_prompt": lambda: {
                     "p_now": out['p_now'],
@@ -353,21 +365,36 @@ class Maai():
             if self.mode in mode_outputs:
                 result_dict.update(mode_outputs[self.mode]())
             
-            self.result_dict_queue.put(result_dict)
+            self.last_result = result_dict
             
-            time_process = time.time() - time_start
-            self.list_process_time_context.append(time_process)
+            # Non-blocking put; if full, drop oldest and keep the newest result.
+            try:
+                self.result_dict_queue.put_nowait(result_dict)
+            except queue.Full:
+                try:
+                    _ = self.result_dict_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self.result_dict_queue.put_nowait(result_dict)
+                except queue.Full:
+                    # If still full due to races, drop this result.
+                    pass
             
-            # Performance monitoring (unchanged for clarity)
-            if len(self.list_process_time_context) > self.CALC_PROCESS_TIME_INTERVAL:
-                ave_proc_time = np.mean(self.list_process_time_context)  # np.mean is faster than np.average
-                num_process_frame = len(self.list_process_time_context) / (time.time() - self.last_interval_time)
-                self.last_interval_time = time.time()
+            if self.print_process_time:
+                time_process = time.time() - time_start
+                self.list_process_time_context.append(time_process)
+                
+                # Performance monitoring (unchanged for clarity)
+                if len(self.list_process_time_context) > self.CALC_PROCESS_TIME_INTERVAL:
+                    ave_proc_time = np.mean(self.list_process_time_context)  # np.mean is faster than np.average
+                    num_process_frame = len(self.list_process_time_context) / (time.time() - self.last_interval_time)
+                    self.last_interval_time = time.time()
 
-                print(f'[{self.mode}] Average processing time: {ave_proc_time:.5f} [sec], #process/sec: {num_process_frame:.3f}')
-                self.list_process_time_context.clear()  # clear() is faster than = []
-            
-            self.process_time_abs = time.time()
+                    print(f'[{self.mode}] Average processing time: {ave_proc_time:.5f} [sec], #process/sec: {num_process_frame:.3f}')
+                    self.list_process_time_context.clear()  # clear() is faster than = []
+                
+                self.process_time_abs = time.time()
 
         # Keep only the last samples in the buffer (use views for efficiency)
         self.current_x1_audio = self.current_x1_audio[-self.frame_contxt_padding:].copy()

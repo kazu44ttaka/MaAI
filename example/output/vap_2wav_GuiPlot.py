@@ -20,13 +20,13 @@ def test():
     wav2 = MaaiInput.Wav(wav_file_path="../wav_sample/jpn_sumida_16k.wav")
 
     # Use the GuiPlot to output the result
-    output = MaaiOutput.GuiPlot(frame_rate=10)
+    output = MaaiOutput.GuiPlot(figsize=(18, 9))
 
     maai = Maai(
-        mode="vap",
+        mode="nod",
         lang="jp",
         frame_rate=10,
-        context_len_sec=5,
+        context_len_sec=20,
         audio_ch1=wav1,
         audio_ch2=wav2,
         device="cpu"
@@ -37,6 +37,7 @@ def test():
     while True:
         # Get the result
         result = maai.get_result()
+        result.pop('p_bc', None)
         # Update the result
         output.update(result)
         

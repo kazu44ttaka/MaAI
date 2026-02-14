@@ -204,6 +204,50 @@ class ObjectiveVAP(nn.Module):
         # normalize
         p_all /= p_all.sum(-1, keepdim=True) + 1e-5
         return p_all
+    
+    def probs_speaker_bin_aggregate(
+        self,
+        probs: Tensor,
+        from_bin: int = 0,
+        to_bin: int = 3,
+        scale_with_bins: bool = False,
+    ) -> Tensor:
+        """
+        Aggregate discrete VAP state probabilities into per-speaker, per-bin
+        expected activity.
+
+        Args:
+            probs: (B, n_frames, n_classes) probabilities over codebook states.
+            from_bin/to_bin: inclusive bin range to return.
+            scale_with_bins: if True, scales each bin by its length in frames
+                (i.e., returns expected active frames rather than probability).
+
+        Returns:
+            Tensor of shape (B, n_frames, 2, n_bins_selected) where the last
+            dimension corresponds to bins [from_bin..to_bin].
+        """
+        assert (
+            probs.ndim == 3
+        ), f"Expected probs of shape (B, n_frames, n_classes) but got {probs.shape}"
+        if from_bin < 0 or to_bin >= self.n_bins or from_bin > to_bin:
+            raise ValueError(
+                f"Invalid bin range: from_bin={from_bin}, to_bin={to_bin}, n_bins={self.n_bins}"
+            )
+
+        idx = torch.arange(self.codebook.n_classes, device=probs.device)
+        states = self.codebook.decode(idx)  # (n_classes, 2, n_bins)
+
+        states = states[:, :, from_bin : to_bin + 1]  # (n_classes, 2, n_bins_selected)
+        if scale_with_bins:
+            bin_frames = torch.tensor(
+                self.bin_frames[from_bin : to_bin + 1], device=probs.device, dtype=states.dtype
+            )
+            states = states * bin_frames  # broadcast over (n_classes, 2, n_bins_selected)
+
+        # Expected activity per speaker/bin under the state distribution
+        # (B, n_frames, n_classes) x (n_classes, 2, n_bins_selected) -> (B, n_frames, 2, n_bins_selected)
+        p_bins = torch.einsum("bid,dcn->bicn", probs, states)
+        return p_bins
 
     def window_to_win_dialog_states(self, wins):
         return (wins.sum(-1) > 0).sum(-1)

@@ -11,6 +11,10 @@ import queue
 from . import util
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+import matplotlib.patches as mpatches
+import seaborn as sns
+
+DEFAULT_VAP_BIN_TIMES_SEC = [0.2, 0.4, 0.6, 0.8]
 
 def _draw_bar(value: float, length: int = 30) -> str:
     """基本的なバーグラフを描画"""
@@ -330,25 +334,55 @@ class GuiPlot:
         self.fig = None
         self.axes = dict()
         self.lines = dict()
+        self.images = dict()
+        self.patches = dict()
         self.fills = dict()
         self.keys = []
         self.initialized = False
         self.data_buffer = dict()  # key: list or float
         self.use_fixed_draw_rate = use_fixed_draw_rate
         self._last_draw_time = 0.0
+        sns.set_theme()
+        sns.set_context(font_scale=1.3)
 
     def _init_fig(self, result: Dict[str, any]):
-        special_keys = ['x1', 'x2', 'p_now', 'p_future', 'vad']
+        special_keys = ['x1', 'x2', 'p_now', 'p_future', 'p_bins', 'vad']
         self.keys = [k for k in special_keys if k in result] + [k for k in result.keys() if k not in special_keys and k != 't']
+        
+        # p_binsが存在する場合、各話者のビン1-2とビン3-4の平均を計算して追加
+        if 'p_bins' in result:
+            arr = np.array(result['p_bins'], dtype=float)
+            if arr.ndim == 2 and arr.shape[0] == 2 and arr.shape[1] >= 4:
+                # ビン1-2の平均とビン3-4の平均を計算
+                p_bins_spk1_bin12 = float(np.mean(arr[0, 0:2]))
+                p_bins_spk1_bin34 = float(np.mean(arr[0, 2:4]))
+                p_bins_spk2_bin12 = float(np.mean(arr[1, 0:2]))
+                p_bins_spk2_bin34 = float(np.mean(arr[1, 2:4]))
+                
+                # p_binsの後に追加
+                p_bins_idx = self.keys.index('p_bins')
+                self.keys.insert(p_bins_idx + 1, 'p_bins_spk1_bin12')
+                self.keys.insert(p_bins_idx + 2, 'p_bins_spk1_bin34')
+                self.keys.insert(p_bins_idx + 3, 'p_bins_spk2_bin12')
+                self.keys.insert(p_bins_idx + 4, 'p_bins_spk2_bin34')
+                
+                # resultにも追加（初期値として）
+                result['p_bins_spk1_bin12'] = p_bins_spk1_bin12
+                result['p_bins_spk1_bin34'] = p_bins_spk1_bin34
+                result['p_bins_spk2_bin12'] = p_bins_spk2_bin12
+                result['p_bins_spk2_bin34'] = p_bins_spk2_bin34
+        
         n = len(self.keys)
         self.fig, axs = self.plt.subplots(n, 1, figsize=self.figsize, squeeze=False, tight_layout=True)
         axs = axs.flatten()
         self.axes = {}
         self.lines = {}
+        self.images = {}
+        self.patches = {}
         self.fills = {}
         self.data_buffer = {}
         tab_colors = list(mcolors.TABLEAU_COLORS.values())
-        p_keys = [k for k in self.keys if k.startswith('p_') and k not in ('p_now', 'p_future')]
+        p_keys = [k for k in self.keys if k.startswith('p_') and k not in ('p_now', 'p_future', 'p_bins')]
         color_map = {k: tab_colors[i % len(tab_colors)] for i, k in enumerate(p_keys)}
         th_map = {k: 0.5 for k in p_keys}
         for i, key in enumerate(self.keys):
@@ -364,7 +398,6 @@ class GuiPlot:
                 self.lines[key] = line
                 self.data_buffer[key] = list(buf)
                 ax.set_title('Input waveform 1')
-                ax.set_xlabel('Time [s]')
                 ax.set_ylim(-1, 1)
                 ax.set_xlim(-self.shown_context_sec, 0)
             elif key == 'x2':
@@ -374,46 +407,152 @@ class GuiPlot:
                 self.lines[key] = line
                 self.data_buffer[key] = list(buf)
                 ax.set_title('Input waveform 2')
-                ax.set_xlabel('Time [s]')
                 ax.set_ylim(-1, 1)
                 ax.set_xlim(-self.shown_context_sec, 0)
             elif key == 'p_now':
-                time_x3 = np.linspace(0, self.MAX_CONTEXT_LEN, self.MAX_CONTEXT_LEN)
+                time_x3 = np.linspace(-self.shown_context_sec, 0, self.MAX_CONTEXT_LEN)
                 buf = np.ones(len(time_x3)) * 0.5
                 fill1 = ax.fill_between(time_x3, y1=0.5, y2=buf, where=buf > 0.5, color='y', interpolate=True)
                 fill2 = ax.fill_between(time_x3, y1=buf, y2=0.5, where=buf < 0.5, color='b', interpolate=True)
                 self.fills[key] = (fill1, fill2)
                 self.data_buffer[key] = list(buf)
                 ax.set_title('Output p_now (short-term turn-taking prediction)')
-                ax.set_xlabel('Sample')
-                ax.set_xlim(0, self.MAX_CONTEXT_LEN)
+                ax.set_xlim(-self.shown_context_sec, 0)
                 ax.set_ylim(0, 1)
             elif key == 'p_future':
-                time_x4 = np.linspace(0, self.MAX_CONTEXT_LEN, self.MAX_CONTEXT_LEN)
+                time_x4 = np.linspace(-self.shown_context_sec, 0, self.MAX_CONTEXT_LEN)
                 buf = np.ones(len(time_x4)) * 0.5
                 fill1 = ax.fill_between(time_x4, y1=0.5, y2=buf, where=buf > 0.5, color='y', interpolate=True)
                 fill2 = ax.fill_between(time_x4, y1=buf, y2=0.5, where=buf < 0.5, color='b', interpolate=True)
                 self.fills[key] = (fill1, fill2)
                 self.data_buffer[key] = list(buf)
                 ax.set_title('Output p_future (long-term turn-taking prediction)')
-                ax.set_xlabel('Sample')
-                ax.set_xlim(0, self.MAX_CONTEXT_LEN)
+                ax.set_xlim(-self.shown_context_sec, 0)
+                ax.set_ylim(0, 1)
+            elif key == 'p_bins':
+                # p_bins: per-speaker, per-bin probability (0..1), e.g. shape (2, n_bins)
+                arr = np.array(val, dtype=float)
+                if arr.ndim != 2 or arr.shape[0] != 2:
+                    ax.text(0.5, 0.5, f"Invalid p_bins shape: {arr.shape}", ha='center', va='center')
+                    ax.set_title('p_bins (invalid)')
+                else:
+                    n_bins = int(arr.shape[1])
+                    # Bin widths are proportional to bin duration (seconds).
+                    # Use provided bin_times if present; otherwise default to VAP bins.
+                    bin_times = result.get('bin_times', DEFAULT_VAP_BIN_TIMES_SEC)
+                    try:
+                        bin_times = [float(x) for x in bin_times]
+                    except Exception:
+                        bin_times = DEFAULT_VAP_BIN_TIMES_SEC
+                    if len(bin_times) != n_bins:
+                        # Fallback: uniform widths if mismatch
+                        bin_times = [1.0 for _ in range(n_bins)]
+                    edges = np.concatenate([[0.0], np.cumsum(bin_times)])
+                    total_w = float(edges[-1])
+
+                    # 2 rows (speakers) × n_bins segments, colored by probability (0..1 intensity)
+                    # Speaker 1: Blues, Speaker 2: Oranges
+                    cmap1 = plt.get_cmap('Blues')
+                    cmap2 = plt.get_cmap('Oranges')
+                    rects = [[None for _ in range(n_bins)] for _ in range(2)]
+
+                    ax.set_xlim(0.0, total_w)
+                    ax.set_ylim(0, 2)
+                    ax.set_title('p_bins (per-bin probability at current time)')
+                    # Show cumulative bin edges on x-axis (e.g., [0.2, 0.6, 1.2, 2.0])
+                    xticks = edges[1:]
+                    ax.set_xticks(xticks)
+                    ax.set_xticklabels([f"{float(t):.1f}" for t in xticks])
+                    ax.set_yticks([0.5, 1.5])
+                    ax.set_yticklabels(['spk2', 'spk1'])  # top=spk1, bottom=spk2 visually
+                    ax.set_xlabel('Future time [s] (bin edges)')
+                    ax.set_ylabel('Speaker')
+                    ax.tick_params(axis='both', which='both', length=0)
+
+                    # Bin boundary lines (dashed)
+                    for x in edges[1:-1]:
+                        ax.axvline(float(x), color='k', linestyle='--', linewidth=0.8, alpha=0.4)
+                    ax.axhline(1, color='k', linewidth=0.8, alpha=0.4)
+
+                    texts = [[None for _ in range(n_bins)] for _ in range(2)]
+                    for s in range(2):
+                        for b in range(n_bins):
+                            v = float(np.clip(arr[s, b], 0.0, 1.0))
+                            cmap = cmap1 if s == 0 else cmap2
+                            # y: speaker 0 -> top row (1..2), speaker 1 -> bottom row (0..1)
+                            y0 = 1 if s == 0 else 0
+                            x0 = float(edges[b])
+                            w = float(bin_times[b])
+                            r = mpatches.Rectangle(
+                                (x0, y0),
+                                w,
+                                1.0,
+                                facecolor=cmap(v),
+                                edgecolor=(0, 0, 0, 0.2),
+                                linewidth=0.8,
+                            )
+                            ax.add_patch(r)
+                            rects[s][b] = r
+                            
+                            # 各ビンの中心に確率値を表示
+                            text_x = x0 + w / 2
+                            text_y = y0 + 0.5
+                            # 背景色に応じてテキスト色を調整（暗い色の場合は白、明るい色の場合は黒）
+                            text_color = 'white' if v > 0.5 else 'black'
+                            t = ax.text(text_x, text_y, f'{v:.2f}', 
+                                       ha='center', va='center', 
+                                       fontsize=9, fontweight='bold',
+                                       color=text_color)
+                            texts[s][b] = t
+
+                    # store for updates
+                    self.patches[key] = {
+                        "rects": rects,
+                        "texts": texts,
+                        "n_bins": n_bins,
+                        "bin_times": bin_times,
+                        "cmap1": cmap1,
+                        "cmap2": cmap2,
+                    }
+                    self.data_buffer[key] = arr  # keep last value
+            elif key in ['p_bins_spk1_bin12', 'p_bins_spk1_bin34', 'p_bins_spk2_bin12', 'p_bins_spk2_bin34']:
+                # p_nowやp_futureと同じ表示形式（0.5を基準にした塗りつぶし）
+                time_x = np.linspace(-self.shown_context_sec, 0, self.MAX_CONTEXT_LEN)
+                buf = np.ones(len(time_x)) * 0.5
+                # 話者1は黄色、話者2は青色
+                if 'spk1' in key:
+                    fill1 = ax.fill_between(time_x, y1=0.5, y2=buf, where=buf > 0.5, color='y', interpolate=True)
+                    fill2 = ax.fill_between(time_x, y1=buf, y2=0.5, where=buf < 0.5, color='b', interpolate=True)
+                else:
+                    fill1 = ax.fill_between(time_x, y1=0.5, y2=buf, where=buf > 0.5, color='b', interpolate=True)
+                    fill2 = ax.fill_between(time_x, y1=buf, y2=0.5, where=buf < 0.5, color='y', interpolate=True)
+                self.fills[key] = (fill1, fill2)
+                self.data_buffer[key] = list(buf)
+                # タイトルを設定
+                if key == 'p_bins_spk1_bin12':
+                    ax.set_title('p_bins Speaker1 Bin1-2 Average')
+                elif key == 'p_bins_spk1_bin34':
+                    ax.set_title('p_bins Speaker1 Bin3-4 Average')
+                elif key == 'p_bins_spk2_bin12':
+                    ax.set_title('p_bins Speaker2 Bin1-2 Average')
+                elif key == 'p_bins_spk2_bin34':
+                    ax.set_title('p_bins Speaker2 Bin3-4 Average')
+                ax.set_xlim(-self.shown_context_sec, 0)
                 ax.set_ylim(0, 1)
             elif key.startswith('p_'):
                 color = color_map.get(key, 'green')
                 th = th_map.get(key, 0.5)
-                time_x = np.linspace(0, self.MAX_CONTEXT_LEN, self.MAX_CONTEXT_LEN)
+                time_x = np.linspace(-self.shown_context_sec, 0, self.MAX_CONTEXT_LEN)
                 buf = np.zeros(len(time_x))
                 fill = ax.fill_between(time_x, y1=0.0, y2=buf, color=color, interpolate=True)
                 self.fills[key] = fill
                 self.data_buffer[key] = list(buf)
                 ax.set_title(key)
-                ax.set_xlabel('Sample')
-                ax.set_xlim(0, self.MAX_CONTEXT_LEN)
+                ax.set_xlim(-self.shown_context_sec, 0)
                 ax.set_ylim(0, th*2)
                 ax.axhline(y=th, color='black', linestyle='--')
             elif key == 'vad':
-                time_x = np.arange(self.MAX_CONTEXT_LEN)
+                time_x = np.linspace(-self.shown_context_sec, 0, self.MAX_CONTEXT_LEN)
                 buf1 = np.zeros(self.MAX_CONTEXT_LEN)
                 buf2 = np.zeros(self.MAX_CONTEXT_LEN)
                 fill1 = ax.fill_between(time_x, y1=0, y2=buf1, where=buf1>0, color='y', alpha=0.7, label='VAD1', interpolate=True)
@@ -421,10 +560,9 @@ class GuiPlot:
                 self.fills[key] = (fill1, fill2)
                 self.data_buffer[key] = [list(buf1), list(buf2)]
                 ax.set_title('Voice Activity Detection (VAD)')
-                ax.set_xlabel('Frame')
                 ax.set_ylabel('VAD2  VAD1')
                 ax.set_ylim(-1, 1)
-                ax.set_xlim(0, self.MAX_CONTEXT_LEN)
+                ax.set_xlim(-self.shown_context_sec, 0)
                 ax.axhline(0, color='black', linestyle='--', linewidth=1)
                 ax.legend(loc='upper right')
             elif isinstance(val, (np.ndarray, list, tuple)) and np.array(val).ndim == 1 and len(val) > 1:
@@ -443,6 +581,15 @@ class GuiPlot:
             else:
                 ax.text(0.5, 0.5, str(val), ha='center', va='center')
                 ax.set_title(key)
+            # By default, only show x tick labels on the last subplot to reduce clutter.
+            # Exception: p_bins uses x-axis as future-time bin edges, so it should always show tick labels.
+            if key == 'p_bins':
+                ax.tick_params(labelbottom=True)
+            elif i == len(self.keys) - 1:
+                ax.set_xlabel('Time [s]')
+                ax.tick_params(labelbottom=True)
+            else:
+                ax.tick_params(labelbottom=False)
         self.fig.tight_layout()
         self.plt.ion()
         self.plt.show()
@@ -483,7 +630,7 @@ class GuiPlot:
                     buf = buf[-self.MAX_CONTEXT_LEN:]
                 self.data_buffer[key] = buf
                 if draw:
-                    time_x = np.linspace(0, self.MAX_CONTEXT_LEN, self.MAX_CONTEXT_LEN)
+                    time_x = np.linspace(-self.shown_context_sec, 0, self.MAX_CONTEXT_LEN)
                     ax = self.axes[key]
                     arr = np.array(buf)
                     fills = self.fills[key]
@@ -493,6 +640,78 @@ class GuiPlot:
                     fill1 = ax.fill_between(time_x, y1=0.5, y2=arr, where=arr > 0.5, color='y', interpolate=True)
                     fill2 = ax.fill_between(time_x, y1=arr, y2=0.5, where=arr < 0.5, color='b', interpolate=True)
                     self.fills[key] = [fill1, fill2]
+            elif key in ['p_bins_spk1_bin12', 'p_bins_spk1_bin34', 'p_bins_spk2_bin12', 'p_bins_spk2_bin34'] and key in self.fills:
+                buf = self.data_buffer[key]
+                # valはスカラー値なので、直接floatに変換
+                val_float = float(val) if isinstance(val, (int, float, np.floating, np.integer)) else float(val[0])
+                buf = buf + [val_float]
+                if len(buf) > self.MAX_CONTEXT_LEN:
+                    buf = buf[-self.MAX_CONTEXT_LEN:]
+                self.data_buffer[key] = buf
+                if draw:
+                    time_x = np.linspace(-self.shown_context_sec, 0, self.MAX_CONTEXT_LEN)
+                    ax = self.axes[key]
+                    arr = np.array(buf)
+                    fills = self.fills[key]
+                    for f in fills:
+                        if f is not None:
+                            f.remove()
+                    # 話者1は黄色が上、話者2は青色が上
+                    if 'spk1' in key:
+                        fill1 = ax.fill_between(time_x, y1=0.5, y2=arr, where=arr > 0.5, color='y', interpolate=True)
+                        fill2 = ax.fill_between(time_x, y1=arr, y2=0.5, where=arr < 0.5, color='b', interpolate=True)
+                    else:
+                        fill1 = ax.fill_between(time_x, y1=0.5, y2=arr, where=arr > 0.5, color='b', interpolate=True)
+                        fill2 = ax.fill_between(time_x, y1=arr, y2=0.5, where=arr < 0.5, color='y', interpolate=True)
+                    self.fills[key] = [fill1, fill2]
+            elif key == 'p_bins' and key in self.patches:
+                arr = np.array(val, dtype=float)
+                if arr.ndim == 2 and arr.shape[0] == 2:
+                    meta = self.patches[key]
+                    n_bins_expected = int(meta.get("n_bins", arr.shape[1]))
+                    if arr.shape[1] != n_bins_expected:
+                        # If bin count changes at runtime, easiest is to re-init the figure
+                        # (rare; avoids complex patch reconstruction in-place)
+                        self.initialized = False
+                        break
+                    # If bin_times are provided and changed, re-init to rebuild geometry
+                    if 'bin_times' in result:
+                        try:
+                            bt = [float(x) for x in result.get('bin_times')]
+                        except Exception:
+                            bt = None
+                        if bt is not None and bt != meta.get("bin_times"):
+                            self.initialized = False
+                            break
+                    rects = meta["rects"]
+                    texts = meta.get("texts", [[None for _ in range(n_bins_expected)] for _ in range(2)])
+                    cmap1 = meta["cmap1"]
+                    cmap2 = meta["cmap2"]
+                    for s in range(2):
+                        cmap = cmap1 if s == 0 else cmap2
+                        for b in range(n_bins_expected):
+                            v = float(np.clip(arr[s, b], 0.0, 1.0))
+                            rects[s][b].set_facecolor(cmap(v))
+                            # テキストも更新
+                            if texts[s][b] is not None:
+                                texts[s][b].set_text(f'{v:.2f}')
+                                # 背景色に応じてテキスト色を調整
+                                text_color = 'white' if v > 0.5 else 'black'
+                                texts[s][b].set_color(text_color)
+                    self.data_buffer[key] = arr
+                    
+                    # 各話者のビン1-2とビン3-4の平均を計算して更新
+                    if arr.shape[1] >= 4:
+                        p_bins_spk1_bin12 = float(np.mean(arr[0, 0:2]))
+                        p_bins_spk1_bin34 = float(np.mean(arr[0, 2:4]))
+                        p_bins_spk2_bin12 = float(np.mean(arr[1, 0:2]))
+                        p_bins_spk2_bin34 = float(np.mean(arr[1, 2:4]))
+                        
+                        # 平均値をresultに追加（次のループで処理される）
+                        result['p_bins_spk1_bin12'] = p_bins_spk1_bin12
+                        result['p_bins_spk1_bin34'] = p_bins_spk1_bin34
+                        result['p_bins_spk2_bin12'] = p_bins_spk2_bin12
+                        result['p_bins_spk2_bin34'] = p_bins_spk2_bin34
             elif key.startswith('p_') and key in self.fills:
                 buf = self.data_buffer[key]
                 color = color_map.get(key, 'green')
@@ -501,7 +720,7 @@ class GuiPlot:
                     buf = buf[-self.MAX_CONTEXT_LEN:]
                 self.data_buffer[key] = buf
                 if draw:
-                    time_x = np.linspace(0, self.MAX_CONTEXT_LEN, self.MAX_CONTEXT_LEN)
+                    time_x = np.linspace(-self.shown_context_sec, 0, self.MAX_CONTEXT_LEN)
                     ax = self.axes[key]
                     arr = np.array(buf)
                     f = self.fills[key]
@@ -520,7 +739,7 @@ class GuiPlot:
                     buf2 = buf2[-self.MAX_CONTEXT_LEN:]
                 self.data_buffer[key] = [buf1, buf2]
                 if draw:
-                    time_x = np.arange(self.MAX_CONTEXT_LEN)
+                    time_x = np.linspace(-self.shown_context_sec, 0, self.MAX_CONTEXT_LEN)
                     ax = self.axes[key]
                     arr1 = np.array(buf1)
                     arr2 = np.array(buf2)
