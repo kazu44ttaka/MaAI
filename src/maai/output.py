@@ -173,8 +173,6 @@ class TcpReceiver:
             vap_result = util.conv_bytearray_2_vapresult_bc_2type(data)
         elif self.mode == 'nod':
             vap_result = util.conv_bytearray_2_vapresult_nod(data)
-        elif self.mode == 'nod_para':
-            vap_result = util.conv_bytearray_2_vapresult_nod_para(data)
         else:
             raise ValueError(f"Invalid mode: {self.mode}")
         return vap_result
@@ -234,8 +232,6 @@ class TcpTransmitter:
             data_sent = util.conv_vapresult_2_bytearray_bc_2type(result_dict)
         elif self.mode == 'nod':
             data_sent = util.conv_vapresult_2_bytearray_nod(result_dict)
-        elif self.mode == 'nod_para':
-            data_sent = util.conv_vapresult_2_bytearray_nod_para(result_dict)
         else:
             raise ValueError(f"Invalid mode: {self.mode}")
         return data_sent
@@ -350,8 +346,7 @@ class GuiPlot:
         sns.set_context(font_scale=1.3)
 
     def _init_fig(self, result: Dict[str, any]):
-        special_keys = ['x1', 'x2', 'p_now', 'p_future', 'p_bins', 'vad',
-                        'p_nod', 'p_bc', 'nod_count_probs', 'nod_range', 'nod_speed', 'p_swing_up', 'nod_swing_up_value']
+        special_keys = ['x1', 'x2', 'p_now', 'p_future', 'p_bins', 'vad']
         self.keys = [k for k in special_keys if k in result] + [k for k in result.keys() if k not in special_keys and k != 't']
         
         # p_binsが存在する場合、各話者のビン1-2とビン3-4の平均を計算して追加
@@ -544,31 +539,6 @@ class GuiPlot:
                     ax.set_title('p_bins Speaker2 Bin3-4 Average')
                 ax.set_xlim(-self.shown_context_sec, 0)
                 ax.set_ylim(0, 1)
-            elif key == 'nod_count_probs':
-                # 頷き回数クラスの確率分布（棒グラフ）
-                arr = np.array(val, dtype=float).flatten()
-                n_classes = len(arr)
-                class_labels = [str(i) for i in range(n_classes)]
-                bar_colors = ['#4CAF50', '#2196F3', '#FF9800', '#E91E63', '#9C27B0'][:n_classes]
-                bars = ax.bar(class_labels, arr, color=bar_colors)
-                self.lines[key] = bars
-                self.data_buffer[key] = arr
-                ax.set_title('Nod Count Probabilities')
-                ax.set_ylim(0, 1)
-                ax.set_ylabel('Probability')
-                ax.set_xlabel('Count class')
-            elif key in ['nod_range', 'nod_speed', 'nod_swing_up_value']:
-                # 回帰値の時系列プロット
-                time_x = np.linspace(-self.shown_context_sec, 0, self.MAX_CONTEXT_LEN)
-                buf = np.zeros(len(time_x))
-                color = {'nod_range': '#E91E63', 'nod_speed': '#9C27B0', 'nod_swing_up_value': '#00BCD4'}[key]
-                line, = ax.plot(time_x, buf, c=color)
-                self.lines[key] = line
-                self.data_buffer[key] = list(buf)
-                title_map = {'nod_range': 'Nod Range', 'nod_speed': 'Nod Speed', 'nod_swing_up_value': 'Nod Swing Up Value'}
-                ax.set_title(title_map[key])
-                ax.set_xlim(-self.shown_context_sec, 0)
-                # y軸は自動スケーリング（updateで調整）
             elif key.startswith('p_'):
                 color = color_map.get(key, 'green')
                 th = th_map.get(key, 0.5)
@@ -694,27 +664,6 @@ class GuiPlot:
                         fill1 = ax.fill_between(time_x, y1=0.5, y2=arr, where=arr > 0.5, color='b', interpolate=True)
                         fill2 = ax.fill_between(time_x, y1=arr, y2=0.5, where=arr < 0.5, color='y', interpolate=True)
                     self.fills[key] = [fill1, fill2]
-            elif key == 'nod_count_probs' and key in self.lines:
-                # 頷き回数クラスの確率分布を更新
-                arr = np.array(val, dtype=float).flatten()
-                self.data_buffer[key] = arr
-                if draw:
-                    bars = self.lines[key]
-                    for bar, v in zip(bars, arr):
-                        bar.set_height(v)
-            elif key in ['nod_range', 'nod_speed', 'nod_swing_up_value'] and key in self.lines:
-                # 回帰値の時系列を更新
-                buf = self.data_buffer[key]
-                buf = buf + [float(val)]
-                if len(buf) > self.MAX_CONTEXT_LEN:
-                    buf = buf[-self.MAX_CONTEXT_LEN:]
-                self.data_buffer[key] = buf
-                if draw:
-                    time_x = np.linspace(-self.shown_context_sec, 0, self.MAX_CONTEXT_LEN)
-                    self.lines[key].set_data(time_x, buf)
-                    ax = self.axes[key]
-                    ax.relim()
-                    ax.autoscale_view()
             elif key == 'p_bins' and key in self.patches:
                 arr = np.array(val, dtype=float)
                 if arr.ndim == 2 and arr.shape[0] == 2:
