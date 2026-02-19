@@ -376,8 +376,9 @@ def load_CPC(checkpoint_cpc, load_state_dict=True):
         checkpoint = torch.hub.load_state_dict_from_url(
             checkpoint_url, progress=False, map_location="cpu"
         )
-        makedirs(dirname(checkpoint_cpc))
-        torch.save(checkpoint, checkpoint_cpc)
+        if checkpoint_cpc:
+            makedirs(dirname(checkpoint_cpc), exist_ok=True)
+            torch.save(checkpoint, checkpoint_cpc)
     
     temp = {"cpc": checkpoint_cpc}
     loadArgs(locArgs, argparse.Namespace(**temp))
@@ -499,12 +500,15 @@ def get_cnn_layer(
     stride: List[int] = [2],
     dilation: List[int] = [1],
     activation: str = "GELU",
+    mode: str = "conv",
 ):
     layers = []
     layers.append(Rearrange("b t d -> b d t"))
     for k, s, d in zip(kernel, stride, dilation):
-        #layers.append(CConv1d(dim, dim, kernel_size=k, stride=s, dilation=d))
-        layers.append(nn.Conv1d(dim, dim, kernel_size=k, stride=s, dilation=d))
+        if mode == "cconv":
+            layers.append(CConv1d(dim, dim, kernel_size=k, stride=s, dilation=d))
+        else:
+            layers.append(nn.Conv1d(dim, dim, kernel_size=k, stride=s, dilation=d))
         layers.append(LayerNorm(dim))
         layers.append(getattr(torch.nn, activation)())
     layers.append(Rearrange("b d t -> b t d"))

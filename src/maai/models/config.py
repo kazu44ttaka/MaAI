@@ -13,8 +13,28 @@ class VapConfig:
     encoder_type: str = "cpc"
     wav2vec_type: str = "mms"
     hubert_model: str = "hubert_jp"
+
+    cpc_model_pt: str = ""
+
+    maai_model_pt: str = "zoom-tri"
+    maai_model_run_name: str = "zoom-tri"
+
+    # Conformer student distilled by maai_encoder/distill_wavlm_student_conf.py
+    maai_conf_model_pt: str = ""
+    maai_conf_model_run_name: str = ""
+
+    lora_rank: int = 0
+
     freeze_encoder: int = 1  # stupid but works (--vap_freeze_encoder 1)
+
+    # VAP pretrained
     load_pretrained: int = 1  # stupid but works (--vap_load_pretrained 1)
+
+    load_pretrained_whole: int = 0
+    load_pretrained_whole_filename: str = ""
+    load_pretrained_whole_runname: str = ""
+
+    pretrained_whole: str = ""
     only_feature_extraction: int = 0
 
     # GPT
@@ -37,6 +57,25 @@ class VapConfig:
     # dim_prompt: int = 1792
     dim_prompt: int = 256
     dim_prompt_2: int = 256
+
+    # Nod parameter prediction settings
+    nod_count_binary: int = 0  # 0=3クラス(1,2,3+), 1=2値(1回 vs 2回以上)
+
+    # Nod parameter head options（タスクごとのMLP有効化設定）
+    # 各ヘッド: 0=Linear, 1=MLP（層数はnod_head_mlp_layersで指定）
+    nod_head_mlp_count: int = 0
+    nod_head_mlp_range: int = 0
+    nod_head_mlp_speed: int = 0
+    nod_head_mlp_swing_binary: int = 0
+    nod_head_mlp_swing_value: int = 0
+    nod_head_mlp_hidden: int = 128  # MLP隠れ層次元（全タスク共通）
+    nod_head_mlp_layers: int = 1    # MLP隠れ層数（全タスク共通）
+    nod_shared_encoder: int = 0     # 0=off, 1=on 全タスク共有特徴抽出層
+    nod_shared_encoder_dim: int = 256
+    nod_head_dropout: float = -1.0  # shared encoder内・MLP内のDropout率。-1=dropoutと同じ値を使用
+
+    # GPT層出力に対するDropout（全ヘッド共通、0=無効）
+    gpt_output_dropout: float = 0.0
 
     @staticmethod
     def add_argparse_args(parser, fields_added=[]):

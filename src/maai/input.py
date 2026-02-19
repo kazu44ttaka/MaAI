@@ -119,6 +119,7 @@ class Mic(Base):
         while True:
             d = self.stream.read(self.FRAME_SIZE, exception_on_overflow=False)
             d = np.frombuffer(d, dtype=np.float32)
+
             d = [float(a) for a in d]
             self._put_to_all_queues(d)
 
@@ -143,6 +144,13 @@ class Wav(Base):
             raise ValueError(f"Unsupported sample rate: {self.SAMPLING_RATE}. Expected 16000 Hz.")
         
         data, _ = sf.read(file=self.wav_file_path, dtype='float32')
+        # If stereo, use the second channel (index 1)
+        if data.ndim == 2 and data.shape[1] >= 2:
+            data = data[:, 1]
+        elif data.ndim == 2 and data.shape[1] == 1:
+            data = data[:, 0]
+        if self.audio_gain != 1.0:
+            data = data * self.audio_gain
         for i in range(0, len(data), self.FRAME_SIZE):
             if i + self.FRAME_SIZE > len(data):
                 break

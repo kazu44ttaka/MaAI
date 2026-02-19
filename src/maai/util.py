@@ -518,3 +518,91 @@ def conv_bytearray_2_vapresult_nod(barr):
     }
     
     return result_vap
+
+#
+# nod_para: VAP result -> Byte
+#
+def conv_vapresult_2_bytearray_nod_para(vap_result):
+    
+    b = b''
+    b += struct.pack('<d', vap_result['t'])
+    
+    b += len(vap_result['x1']).to_bytes(4, BYTE_ORDER)
+    b += conv_floatarray_2_byte(vap_result['x1'])
+    
+    b += len(vap_result['x2']).to_bytes(4, BYTE_ORDER)
+    b += conv_floatarray_2_byte(vap_result['x2'])
+    
+    b += struct.pack('<d', vap_result['p_bc'])
+    b += struct.pack('<d', vap_result['p_nod'])
+    
+    # nod_count: list or float -> always serialize as list
+    nod_count = vap_result['nod_count']
+    if isinstance(nod_count, (int, float)):
+        nod_count = [nod_count]
+    b += len(nod_count).to_bytes(4, BYTE_ORDER)
+    b += conv_floatarray_2_byte(nod_count)
+    
+    b += struct.pack('<d', vap_result['nod_range'])
+    b += struct.pack('<d', vap_result['nod_speed'])
+    b += struct.pack('<d', vap_result['nod_swing_up_binary'])
+    b += struct.pack('<d', vap_result['nod_swing_up_value'])
+    b += struct.pack('<d', vap_result['nod_swing_up_continuous'])
+    
+    return b
+
+#
+# nod_para: Byte -> VAP result
+#
+def conv_bytearray_2_vapresult_nod_para(barr):
+    
+    idx = 0
+    t = struct.unpack('<d', barr[idx:idx+8])[0]
+    idx += 8
+    
+    len_x1 = struct.unpack('<I', barr[idx:idx+4])[0]
+    idx += 4
+    x1 = conv_bytearray_2_floatarray(barr[idx:idx+8*len_x1])
+    idx += 8*len_x1
+    
+    len_x2 = struct.unpack('<I', barr[idx:idx+4])[0]
+    idx += 4
+    x2 = conv_bytearray_2_floatarray(barr[idx:idx+8*len_x2])
+    idx += 8*len_x2
+    
+    p_bc = struct.unpack('<d', barr[idx:idx+8])[0]
+    idx += 8
+    p_nod = struct.unpack('<d', barr[idx:idx+8])[0]
+    idx += 8
+    
+    len_nod_count = struct.unpack('<I', barr[idx:idx+4])[0]
+    idx += 4
+    nod_count = conv_bytearray_2_floatarray(barr[idx:idx+8*len_nod_count])
+    idx += 8*len_nod_count
+    if len(nod_count) == 1:
+        nod_count = nod_count[0]
+    
+    nod_range = struct.unpack('<d', barr[idx:idx+8])[0]
+    idx += 8
+    nod_speed = struct.unpack('<d', barr[idx:idx+8])[0]
+    idx += 8
+    nod_swing_up_binary = struct.unpack('<d', barr[idx:idx+8])[0]
+    idx += 8
+    nod_swing_up_value = struct.unpack('<d', barr[idx:idx+8])[0]
+    idx += 8
+    nod_swing_up_continuous = struct.unpack('<d', barr[idx:idx+8])[0]
+    idx += 8
+    
+    return {
+        't': t,
+        'x1': x1,
+        'x2': x2,
+        'p_bc': p_bc,
+        'p_nod': p_nod,
+        'nod_count': nod_count,
+        'nod_range': nod_range,
+        'nod_speed': nod_speed,
+        'nod_swing_up_binary': nod_swing_up_binary,
+        'nod_swing_up_value': nod_swing_up_value,
+        'nod_swing_up_continuous': nod_swing_up_continuous,
+    }

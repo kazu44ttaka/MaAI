@@ -94,8 +94,12 @@ def _get_bar_for_value(key: str, value: Any, bar_length: int = 30, bar_type: str
             else:
                 return "N/A", 0.0
         elif len(value) == 2:
-            _value = value[0] / (value[0] + value[1])
-            return _draw_balance_bar(float(_value), bar_length), value
+            if isinstance(value[0], (int, float)) and isinstance(value[1], (int, float)):
+                total = value[0] + value[1]
+                _value = value[0] / total if total != 0 else 0.5
+                return _draw_balance_bar(float(_value), bar_length), value
+            else:
+                return "N/A", 0.0
         else:
             return "N/A", 0.0
     elif isinstance(value, (int, float)):
@@ -151,6 +155,33 @@ class ConsoleBar:
                 continue
             if not isinstance(value, (float, int)):
                 value = np.squeeze(np.array(value)).tolist()
+            # vap/vap_mc: p_bins は 2話者×Nビンのネスト構造なので専用表示
+            if key == 'p_bins' and isinstance(value, list) and len(value) == 2 and isinstance(value[0], list):
+                for si, spk_bins in enumerate(value):
+                    bins_str = ', '.join(f'{b:.3f}' for b in spk_bins)
+                    bar = _draw_bar(float(np.mean(spk_bins)), self.bar_length)
+                    print(f"{'p_bins(spk'+str(si+1)+')':15}: {bar} [{bins_str}]")
+                continue
+            # nod_para: nod_count は argmax で表示
+            if key == 'nod_count' and isinstance(value, list) and len(value) > 1:
+                _labels = ['1回', '2回', '3回+']
+                _idx = int(np.argmax(value))
+                _label = _labels[_idx] if _idx < len(_labels) else f'class{_idx}'
+                _prob = value[_idx]
+                bar = _draw_bar(_prob, self.bar_length)
+                print(f"{key:15}: {bar} {_label} ({_prob:.3f})")
+                continue
+            # nod_para: nod_range (0~0.15), nod_speed (0~0.25)
+            if key == 'nod_range':
+                _v = float(value)
+                bar = _draw_bar(_v / 0.15, self.bar_length)
+                print(f"{key:15}: {bar} ({_v:.4f})")
+                continue
+            if key == 'nod_speed':
+                _v = float(value)
+                bar = _draw_bar(_v / 0.25, self.bar_length)
+                print(f"{key:15}: {bar} ({_v:.4f})")
+                continue
             bar, _value = _get_bar_for_value(key, value, self.bar_length, self.bar_type)
             if type(_value) is float:
                 print(f"{key:15}: {bar} ({_value:.3f})")
@@ -173,6 +204,8 @@ class TcpReceiver:
             vap_result = util.conv_bytearray_2_vapresult_bc_2type(data)
         elif self.mode == 'nod':
             vap_result = util.conv_bytearray_2_vapresult_nod(data)
+        elif self.mode == 'nod_para':
+            vap_result = util.conv_bytearray_2_vapresult_nod_para(data)
         else:
             raise ValueError(f"Invalid mode: {self.mode}")
         return vap_result
@@ -232,6 +265,8 @@ class TcpTransmitter:
             data_sent = util.conv_vapresult_2_bytearray_bc_2type(result_dict)
         elif self.mode == 'nod':
             data_sent = util.conv_vapresult_2_bytearray_nod(result_dict)
+        elif self.mode == 'nod_para':
+            data_sent = util.conv_vapresult_2_bytearray_nod_para(result_dict)
         else:
             raise ValueError(f"Invalid mode: {self.mode}")
         return data_sent
@@ -346,7 +381,9 @@ class GuiPlot:
         sns.set_context(font_scale=1.3)
 
     def _init_fig(self, result: Dict[str, any]):
-        special_keys = ['x1', 'x2', 'p_now', 'p_future', 'p_bins', 'vad']
+        special_keys = ['x1', 'x2', 'p_now', 'p_future', 'p_bins', 'vad',
+                        'p_bc', 'p_nod', 'nod_count', 'nod_range', 'nod_speed',
+                        'nod_swing_up_binary', 'nod_swing_up_value', 'nod_swing_up_continuous']
         self.keys = [k for k in special_keys if k in result] + [k for k in result.keys() if k not in special_keys and k != 't']
         
         # p_binsが存在する場合、各話者のビン1-2とビン3-4の平均を計算して追加
@@ -565,6 +602,45 @@ class GuiPlot:
                 ax.set_xlim(-self.shown_context_sec, 0)
                 ax.axhline(0, color='black', linestyle='--', linewidth=1)
                 ax.legend(loc='upper right')
+            # --- nod_para: swing_up_binary (0-1 fill) ---
+            elif key == 'nod_swing_up_binary':
+                time_x = np.linspace(-self.shown_context_sec, 0, self.MAX_CONTEXT_LEN)
+                buf = np.zeros(len(time_x))
+                fill = ax.fill_between(time_x, y1=0.0, y2=buf, color='mediumpurple', interpolate=True)
+                self.fills[key] = fill
+                self.data_buffer[key] = list(buf)
+                ax.set_title('nod_swing_up_binary')
+                ax.set_xlim(-self.shown_context_sec, 0)
+                ax.set_ylim(0, 1)
+                ax.axhline(y=0.5, color='black', linestyle='--')
+            # --- nod_para: nod_count (multi-class line plot) ---
+            elif key == 'nod_count' and isinstance(val, list) and len(val) > 1:
+                n_classes = len(val)
+                time_x = np.linspace(-self.shown_context_sec, 0, self.MAX_CONTEXT_LEN)
+                count_lines = {}
+                count_colors = ['tab:blue', 'tab:orange', 'tab:green']
+                count_labels = ['1回', '2回', '3回+']
+                for ci in range(n_classes):
+                    c = count_colors[ci % len(count_colors)]
+                    label = count_labels[ci] if ci < len(count_labels) else f'class{ci}'
+                    buf_ci = np.zeros(len(time_x))
+                    l, = ax.plot(time_x, buf_ci, c=c, linewidth=1.5, label=label)
+                    count_lines[ci] = l
+                self.lines[key] = count_lines
+                self.data_buffer[key] = {ci: list(np.zeros(self.MAX_CONTEXT_LEN)) for ci in range(n_classes)}
+                ax.set_title('nod_count (class probabilities)')
+                ax.set_xlim(-self.shown_context_sec, 0)
+                ax.set_ylim(0, 1)
+                ax.legend(loc='upper right', fontsize=8)
+            # --- nod_para: regression values (time-series line) ---
+            elif key in ('nod_range', 'nod_speed', 'nod_swing_up_value', 'nod_swing_up_continuous'):
+                time_x = np.linspace(-self.shown_context_sec, 0, self.MAX_CONTEXT_LEN)
+                buf = np.zeros(len(time_x))
+                line, = ax.plot(time_x, buf, c='seagreen', linewidth=1.5)
+                self.lines[key] = line
+                self.data_buffer[key] = list(buf)
+                ax.set_title(key)
+                ax.set_xlim(-self.shown_context_sec, 0)
             elif isinstance(val, (np.ndarray, list, tuple)) and np.array(val).ndim == 1 and len(val) > 1:
                 x = np.arange(len(val))
                 line, = ax.plot(x, val, c='g')
@@ -750,6 +826,50 @@ class GuiPlot:
                     fill1 = ax.fill_between(time_x, y1=0, y2=arr1, where=arr1>0, color='y', alpha=0.7, label='VAD1', interpolate=True)
                     fill2 = ax.fill_between(time_x, y1=0, y2=-arr2, where=arr2>0, color='b', alpha=0.7, label='VAD2', interpolate=True)
                     self.fills[key] = [fill1, fill2]
+            # --- nod_para: swing_up_binary (0-1 fill) ---
+            elif key == 'nod_swing_up_binary' and key in self.fills:
+                buf = self.data_buffer[key]
+                buf = buf + [float(val)]
+                if len(buf) > self.MAX_CONTEXT_LEN:
+                    buf = buf[-self.MAX_CONTEXT_LEN:]
+                self.data_buffer[key] = buf
+                if draw:
+                    time_x = np.linspace(-self.shown_context_sec, 0, self.MAX_CONTEXT_LEN)
+                    ax = self.axes[key]
+                    arr = np.array(buf)
+                    f = self.fills[key]
+                    if f is not None:
+                        f.remove()
+                    fill = ax.fill_between(time_x, y1=0.0, y2=arr, color='mediumpurple', interpolate=True)
+                    self.fills[key] = fill
+            # --- nod_para: nod_count (multi-class time series) ---
+            elif key == 'nod_count' and isinstance(self.data_buffer.get(key), dict):
+                nod_count_val = val
+                if isinstance(nod_count_val, list):
+                    for ci in range(len(nod_count_val)):
+                        if ci in self.data_buffer[key]:
+                            buf_ci = self.data_buffer[key][ci]
+                            buf_ci = buf_ci + [float(nod_count_val[ci])]
+                            if len(buf_ci) > self.MAX_CONTEXT_LEN:
+                                buf_ci = buf_ci[-self.MAX_CONTEXT_LEN:]
+                            self.data_buffer[key][ci] = buf_ci
+                    if draw:
+                        for ci in self.lines[key]:
+                            self.lines[key][ci].set_ydata(np.array(self.data_buffer[key][ci]))
+            # --- nod_para: regression values (time-series line with auto y-scale) ---
+            elif key in ('nod_range', 'nod_speed', 'nod_swing_up_value', 'nod_swing_up_continuous') and key in self.lines:
+                buf = self.data_buffer[key]
+                buf = buf + [float(val)]
+                if len(buf) > self.MAX_CONTEXT_LEN:
+                    buf = buf[-self.MAX_CONTEXT_LEN:]
+                self.data_buffer[key] = buf
+                if draw:
+                    arr = np.array(buf)
+                    self.lines[key].set_ydata(arr)
+                    ax = self.axes[key]
+                    ymin, ymax = float(arr.min()), float(arr.max())
+                    margin = max(0.1, (ymax - ymin) * 0.1)
+                    ax.set_ylim(ymin - margin, ymax + margin)
             elif key in self.lines:
                 buf = self.data_buffer[key]
                 if isinstance(val, (np.ndarray, list, tuple)) and len(val) > 1:
