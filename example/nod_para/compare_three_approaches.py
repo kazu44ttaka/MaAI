@@ -34,16 +34,17 @@ import matplotlib.pyplot as plt
 
 # ---- config ----
 RUN_ABC = False  # True: A/B/C を実行。False: A/B/C をスキップ（D/E/F のみ）
+CHECKPOINT = os.path.join(_assets, "small_epoch9-val_nod_all_5.08092.ckpt")
 # CHECKPOINT = os.path.join(_assets, "medium2_epoch17-val_nod_all_4.12108.ckpt")
-CHECKPOINT = os.path.join(_assets, "medium_epoch17-val_nod_all_4.35415.ckpt")
-WAV_FILE = r"C:\Users\kazu4\git\kyotou-attentive-listening\MaAI\example\wav_sample\jpn_sumida_16k.wav"
+# CHECKPOINT = os.path.join(_assets, "medium_epoch17-val_nod_all_4.35415.ckpt")
+WAV_FILE = os.path.join(_here, "..", "wav_sample", "jpn_sumida_16k.wav")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 FRAME_RATE = 10  # inference frame rate (Hz)
 CROP_SEC = 40.0  # crop length
 CROP_OFFSET_SEC = 7.5  # start offset for cropping
 SAMPLE_RATE = 16000
 
-USE_ANCHOR_FRAMES = True
+USE_ANCHOR_FRAMES = False
 
 # ===========================================================================
 # 1. Load and crop WAV
@@ -93,17 +94,32 @@ def load_model_training(ckpt_path, device):
         orig_maai_pt = getattr(conf_obj, "maai_model_pt", "")
         if not os.path.exists(orig_maai_pt):
             _enc_name = os.path.basename(orig_maai_pt)
+            # まず元の名前で検索
+            found = False
             for _search_dir in [_assets, _vap_root]:
                 _local_enc = os.path.join(_search_dir, _enc_name)
                 if os.path.exists(_local_enc):
                     conf_obj.maai_model_pt = _local_enc
                     override_kwargs["conf"] = conf_obj
                     print(f"  [maai_model_pt] {orig_maai_pt} -> {_local_enc}")
+                    found = True
                     break
+
+            # 見つからない場合は small_ プレフィックスを付けて検索
+            if not found:
+                _alt_enc_name = "small_" + _enc_name
+                for _search_dir in [_assets, _vap_root]:
+                    _local_enc = os.path.join(_search_dir, _alt_enc_name)
+                    if os.path.exists(_local_enc):
+                        conf_obj.maai_model_pt = _local_enc
+                        override_kwargs["conf"] = conf_obj
+                        print(f"  [maai_model_pt] {orig_maai_pt} -> {_local_enc} (alt name)")
+                        found = True
+                        break
 
     # evaluation_nod_para.py と同じ: VAPModel.load_from_checkpoint
     model = VAPModel.load_from_checkpoint(
-        ckpt_path, weights_only=False, **override_kwargs
+        ckpt_path, weights_only=False, strict=False, **override_kwargs
     )
     model.eval()
 
@@ -157,13 +173,17 @@ def load_model_maai(ckpt_path, frame_rate, device):
     print(f"  encoder_type={conf.encoder_type}, inference_frame_hz={conf.frame_hz}")
     print(f"  dim={conf.dim}, channel_layers={conf.channel_layers}, cross_layers={conf.cross_layers}")
 
-    # 4. n_heads 取得 (model.py と同じロジック)
+    # 4. n_heads 取得 (model.py と同じロジック: d_model // 64)
     _conf_obj = hp.get("conf", None)
     _enc_n_heads = None
     if _conf_obj is not None and hasattr(_conf_obj, "encoder_n_heads"):
         _enc_n_heads = _conf_obj.encoder_n_heads
     if _enc_n_heads is None:
-        _enc_n_heads = hp.get("encoder_n_heads", 8)
+        _enc_proj_key = next((k for k in sd if k == "encoder.model.proj.weight"), None)
+        if _enc_proj_key is not None:
+            _enc_n_heads = sd[_enc_proj_key].shape[0] // 64
+        else:
+            _enc_n_heads = 8
     print(f"  n_heads={_enc_n_heads}")
 
     # 5. モデル構築 & 重みロード

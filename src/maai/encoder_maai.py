@@ -623,6 +623,7 @@ class EncoderMaai(nn.Module):
                     stride=[factor],
                     dilation=[1],
                     activation="GELU",
+                    mode="cconv",
                 )
                 print(f"Downsampling from {output_hz}Hz to {self.frame_hz}Hz (factor={factor})")
         elif output_hz != self.frame_hz:
