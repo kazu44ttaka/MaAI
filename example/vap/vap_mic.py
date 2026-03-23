@@ -9,7 +9,7 @@ import os
 # This allows you to import modules from the src directory without pip installing the package.
 # Uncomment the line below if you need to run this script directly without installing the package.
 
-# sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../src/')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../src/')))
 
 from maai import Maai, MaaiInput, MaaiOutput
 
@@ -29,7 +29,8 @@ def test():
         frame_rate=10,
         audio_ch1=mic,
         audio_ch2=zero,
-        device="cpu",
+        device="cuda",
+        encoder_type="mimi"
     )
 
     maai.start()

@@ -11,6 +11,7 @@ class VapConfig:
 
     # Encoder (training flag)
     encoder_type: str = "cpc"
+    mimi_model_name: str = "kyutai/mimi"
     wav2vec_type: str = "mms"
     hubert_model: str = "hubert_jp"
     freeze_encoder: int = 1  # stupid but works (--vap_freeze_encoder 1)

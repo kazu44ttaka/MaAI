@@ -34,6 +34,8 @@ class Maai():
         device: str = "cpu",
         # num_channels: int = 2,
         cpc_model: str = os.path.expanduser("~/.cache/cpc/60k_epoch4-d0f474de.pt"),
+        encoder_type: str = "cpc",
+        mimi_model_name: str = "kyutai/mimi",
         cache_dir: str = None,
         force_download: bool = False,
         use_kv_cache: bool = True,
@@ -41,6 +43,8 @@ class Maai():
     ):
 
         conf = VapConfig()
+        conf.encoder_type = encoder_type
+        conf.mimi_model_name = mimi_model_name
 
         # # Middle size model
         # if "middle" in lang:
@@ -65,16 +69,28 @@ class Maai():
             from .models.vap_prompt import VapGPT_prompt
             self.vap = VapGPT_prompt(conf)
         
-        self.device = device
+        try:
+            self.device = str(torch.device(device))
+        except RuntimeError as exc:
+            raise ValueError("Device must be a valid torch device string such as 'cpu', 'cuda', or 'cuda:0'.") from exc
 
-        if self.device not in ["cpu", "cuda"]:
-            raise ValueError("Device must be 'cpu' or 'cuda'.")
+        if not (self.device == "cpu" or self.device.startswith("cuda")):
+            raise ValueError("Device must be 'cpu', 'cuda', or 'cuda:N'.")
         
         # Store the initial state of the model to check for unchanged parameters
         initial_state_dict = {name: param.clone() for name, param in self.vap.named_parameters()}
 
         if local_model is None:
-            sd = load_vap_model(mode, frame_rate, context_len_sec, lang, device, cache_dir, force_download)
+            sd = load_vap_model(
+                mode,
+                frame_rate,
+                context_len_sec,
+                lang,
+                device,
+                cache_dir,
+                force_download,
+                encoder_type=conf.encoder_type,
+            )
         else:
             print("Loading model from local file:", local_model)
             sd = torch.load(local_model, map_location="cpu")
@@ -82,16 +98,16 @@ class Maai():
         self.vap.load_encoder(cpc_model=cpc_model)
         self.vap.load_state_dict(sd, strict=False)
 
-        # The downsampling parameters are not loaded by "load_state_dict"
-        self.vap.encoder1.downsample[1].weight = nn.Parameter(sd['encoder.downsample.1.weight'])
-        self.vap.encoder1.downsample[1].bias = nn.Parameter(sd['encoder.downsample.1.bias'])
-        self.vap.encoder1.downsample[2].ln.weight = nn.Parameter(sd['encoder.downsample.2.ln.weight'])
-        self.vap.encoder1.downsample[2].ln.bias = nn.Parameter(sd['encoder.downsample.2.ln.bias'])
-        
-        self.vap.encoder2.downsample[1].weight = nn.Parameter(sd['encoder.downsample.1.weight'])
-        self.vap.encoder2.downsample[1].bias = nn.Parameter(sd['encoder.downsample.1.bias'])
-        self.vap.encoder2.downsample[2].ln.weight = nn.Parameter(sd['encoder.downsample.2.ln.weight'])
-        self.vap.encoder2.downsample[2].ln.bias = nn.Parameter(sd['encoder.downsample.2.ln.bias'])
+        if conf.encoder_type == "cpc" and 'encoder.downsample.1.weight' in sd:
+            self.vap.encoder1.downsample[1].weight = nn.Parameter(sd['encoder.downsample.1.weight'])
+            self.vap.encoder1.downsample[1].bias = nn.Parameter(sd['encoder.downsample.1.bias'])
+            self.vap.encoder1.downsample[2].ln.weight = nn.Parameter(sd['encoder.downsample.2.ln.weight'])
+            self.vap.encoder1.downsample[2].ln.bias = nn.Parameter(sd['encoder.downsample.2.ln.bias'])
+            
+            self.vap.encoder2.downsample[1].weight = nn.Parameter(sd['encoder.downsample.1.weight'])
+            self.vap.encoder2.downsample[1].bias = nn.Parameter(sd['encoder.downsample.1.bias'])
+            self.vap.encoder2.downsample[2].ln.weight = nn.Parameter(sd['encoder.downsample.2.ln.weight'])
+            self.vap.encoder2.downsample[2].ln.bias = nn.Parameter(sd['encoder.downsample.2.ln.bias'])
 
         # Check for parameters that were not updated from their initial values
         for name, param in self.vap.named_parameters():
@@ -158,6 +174,20 @@ class Maai():
         # Thread control
         self._stop_event = threading.Event()
         self._worker_thread = None
+
+        self.reset_runtime_state()
+
+    def reset_runtime_state(self):
+        self.current_x1_audio = []
+        self.current_x2_audio = []
+        self.e1_full = []
+        self.e2_full = []
+        self.vap_cache = None
+
+        for encoder_name in ["encoder1", "encoder2"]:
+            encoder = getattr(self.vap, encoder_name, None)
+            if encoder is not None and hasattr(encoder, "reset_streaming_state"):
+                encoder.reset_streaming_state()
     
     def worker(self):
         
@@ -189,6 +219,8 @@ class Maai():
             # self._mic2_queue.queue.clear()
 
     def start(self):
+
+        self.reset_runtime_state()
 
         self.mic1.start()
         self.mic2.start()
@@ -223,6 +255,8 @@ class Maai():
             self._mic2_queue.queue.clear()
         except Exception:
             pass
+
+        self.reset_runtime_state()
     
     def process(self, x1, x2):
         
@@ -263,6 +297,12 @@ class Maai():
                 x2_ = x2_.to(self.device, non_blocking=True)
 
             e1, e2 = self.vap.encode_audio(x1_, x2_)
+
+            if e1.shape[1] == 0 or e2.shape[1] == 0:
+                self.process_time_abs = time.time()
+                self.current_x1_audio = self.current_x1_audio[-self.frame_contxt_padding:].copy()
+                self.current_x2_audio = self.current_x2_audio[-self.frame_contxt_padding:].copy()
+                return
 
             # Full model
             if not self.use_kv_cache:

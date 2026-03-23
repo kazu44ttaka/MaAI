@@ -5,7 +5,7 @@ from typing import Optional, Tuple
 import torch.nn.functional as F
 
 from .config import VapConfig
-from ..encoder import EncoderCPC
+from ..encoder import build_audio_encoder
 from ..modules import GPT, GPTStereo
 from ..objective import ObjectiveVAP
 
@@ -55,22 +55,14 @@ class VapGPT_bc(nn.Module):
         self.bc_head = nn.Linear(conf.dim, 1)
 
     def load_encoder(self, cpc_model):
-        
-        # Audio Encoder
-        self.encoder1 = EncoderCPC(
-            load_pretrained=True if self.conf.load_pretrained == 1 else False,
-            freeze=self.conf.freeze_encoder,
-            cpc_model=cpc_model
-        )
+        self.encoder1 = build_audio_encoder(self.conf, cpc_model=cpc_model)
         self.encoder1 = self.encoder1.eval()
-        
-        self.encoder2 = EncoderCPC(
-            load_pretrained=True if self.conf.load_pretrained == 1 else False,
-            freeze=self.conf.freeze_encoder,
-            cpc_model=cpc_model
-        )
-
+        self.encoder2 = build_audio_encoder(self.conf, cpc_model=cpc_model)
         self.encoder2 = self.encoder2.eval()
+
+        encoder_dim = getattr(self.encoder1, "output_dim", self.conf.dim)
+        if encoder_dim != self.conf.dim:
+            self.decrease_dimension = nn.Linear(encoder_dim, self.conf.dim)
         
         if self.conf.freeze_encoder == 1:
             print('freeze encoder')
@@ -86,6 +78,10 @@ class VapGPT_bc(nn.Module):
         # Channel swap for temporal consistency
         x1 = self.encoder1(audio2)  # speaker 1 (User)
         x2 = self.encoder2(audio1)  # speaker 2 (System)
+
+        if hasattr(self, "decrease_dimension"):
+            x1 = self.decrease_dimension(x1)
+            x2 = self.decrease_dimension(x2)
 
         return x1, x2
 
