@@ -151,6 +151,33 @@ class ConsoleBar:
                 continue
             if not isinstance(value, (float, int)):
                 value = np.squeeze(np.array(value)).tolist()
+            # vap/vap_mc: p_bins は 2話者×Nビンのネスト構造なので専用表示
+            if key == 'p_bins' and isinstance(value, list) and len(value) == 2 and isinstance(value[0], list):
+                for si, spk_bins in enumerate(value):
+                    bins_str = ', '.join(f'{b:.3f}' for b in spk_bins)
+                    bar = _draw_bar(float(np.mean(spk_bins)), self.bar_length)
+                    print(f"{'p_bins(spk'+str(si+1)+')':15}: {bar} [{bins_str}]")
+                continue
+            # nod_para: nod_count は argmax で表示
+            if key == 'nod_count' and isinstance(value, list) and len(value) > 1:
+                _labels = ['1回', '2回', '3回+']
+                _idx = int(np.argmax(value))
+                _label = _labels[_idx] if _idx < len(_labels) else f'class{_idx}'
+                _prob = value[_idx]
+                bar = _draw_bar(_prob, self.bar_length)
+                print(f"{key:15}: {bar} {_label} ({_prob:.3f})")
+                continue
+            # nod_para: nod_range (0~0.15), nod_speed (0~0.25)
+            if key == 'nod_range':
+                _v = float(value)
+                bar = _draw_bar(_v / 0.15, self.bar_length)
+                print(f"{key:15}: {bar} ({_v:.4f})")
+                continue
+            if key == 'nod_speed':
+                _v = float(value)
+                bar = _draw_bar(_v / 0.25, self.bar_length)
+                print(f"{key:15}: {bar} ({_v:.4f})")
+                continue
             bar, _value = _get_bar_for_value(key, value, self.bar_length, self.bar_type)
             if type(_value) is float:
                 print(f"{key:15}: {bar} ({_value:.3f})")
@@ -349,29 +376,6 @@ class GuiPlot:
         special_keys = ['x1', 'x2', 'p_now', 'p_future', 'p_bins', 'vad']
         self.keys = [k for k in special_keys if k in result] + [k for k in result.keys() if k not in special_keys and k != 't']
         
-        # p_binsが存在する場合、各話者のビン1-2とビン3-4の平均を計算して追加
-        if 'p_bins' in result:
-            arr = np.array(result['p_bins'], dtype=float)
-            if arr.ndim == 2 and arr.shape[0] == 2 and arr.shape[1] >= 4:
-                # ビン1-2の平均とビン3-4の平均を計算
-                p_bins_spk1_bin12 = float(np.mean(arr[0, 0:2]))
-                p_bins_spk1_bin34 = float(np.mean(arr[0, 2:4]))
-                p_bins_spk2_bin12 = float(np.mean(arr[1, 0:2]))
-                p_bins_spk2_bin34 = float(np.mean(arr[1, 2:4]))
-                
-                # p_binsの後に追加
-                p_bins_idx = self.keys.index('p_bins')
-                self.keys.insert(p_bins_idx + 1, 'p_bins_spk1_bin12')
-                self.keys.insert(p_bins_idx + 2, 'p_bins_spk1_bin34')
-                self.keys.insert(p_bins_idx + 3, 'p_bins_spk2_bin12')
-                self.keys.insert(p_bins_idx + 4, 'p_bins_spk2_bin34')
-                
-                # resultにも追加（初期値として）
-                result['p_bins_spk1_bin12'] = p_bins_spk1_bin12
-                result['p_bins_spk1_bin34'] = p_bins_spk1_bin34
-                result['p_bins_spk2_bin12'] = p_bins_spk2_bin12
-                result['p_bins_spk2_bin34'] = p_bins_spk2_bin34
-        
         n = len(self.keys)
         self.fig, axs = self.plt.subplots(n, 1, figsize=self.figsize, squeeze=False, tight_layout=True)
         axs = axs.flatten()
@@ -451,9 +455,14 @@ class GuiPlot:
                     total_w = float(edges[-1])
 
                     # 2 rows (speakers) × n_bins segments, colored by probability (0..1 intensity)
-                    # Speaker 1: Blues, Speaker 2: Oranges
-                    cmap1 = plt.get_cmap('Blues')
-                    cmap2 = plt.get_cmap('Oranges')
+                    # Keep speaker color mapping consistent with p_now/p_future and VAD:
+                    # spk1 -> yellow, spk2 -> blue.
+                    cmap1 = mcolors.LinearSegmentedColormap.from_list(
+                        "spk1_yellow", ["#fffde7", "#fbc02d"]
+                    )
+                    cmap2 = mcolors.LinearSegmentedColormap.from_list(
+                        "spk2_blue", ["#e3f2fd", "#1e88e5"]
+                    )
                     rects = [[None for _ in range(n_bins)] for _ in range(2)]
 
                     ax.set_xlim(0.0, total_w)
@@ -497,8 +506,10 @@ class GuiPlot:
                             # 各ビンの中心に確率値を表示
                             text_x = x0 + w / 2
                             text_y = y0 + 0.5
-                            # 背景色に応じてテキスト色を調整（暗い色の場合は白、明るい色の場合は黒）
-                            text_color = 'white' if v > 0.5 else 'black'
+                            # 背景色に応じてテキスト色を調整（暗い背景では白、明るい背景では黒）
+                            bg = cmap(v)
+                            luminance = 0.2126 * bg[0] + 0.7152 * bg[1] + 0.0722 * bg[2]
+                            text_color = 'white' if luminance < 0.5 else 'black'
                             t = ax.text(text_x, text_y, f'{v:.2f}', 
                                        ha='center', va='center', 
                                        fontsize=9, fontweight='bold',
@@ -515,30 +526,6 @@ class GuiPlot:
                         "cmap2": cmap2,
                     }
                     self.data_buffer[key] = arr  # keep last value
-            elif key in ['p_bins_spk1_bin12', 'p_bins_spk1_bin34', 'p_bins_spk2_bin12', 'p_bins_spk2_bin34']:
-                # p_nowやp_futureと同じ表示形式（0.5を基準にした塗りつぶし）
-                time_x = np.linspace(-self.shown_context_sec, 0, self.MAX_CONTEXT_LEN)
-                buf = np.ones(len(time_x)) * 0.5
-                # 話者1は黄色、話者2は青色
-                if 'spk1' in key:
-                    fill1 = ax.fill_between(time_x, y1=0.5, y2=buf, where=buf > 0.5, color='y', interpolate=True)
-                    fill2 = ax.fill_between(time_x, y1=buf, y2=0.5, where=buf < 0.5, color='b', interpolate=True)
-                else:
-                    fill1 = ax.fill_between(time_x, y1=0.5, y2=buf, where=buf > 0.5, color='b', interpolate=True)
-                    fill2 = ax.fill_between(time_x, y1=buf, y2=0.5, where=buf < 0.5, color='y', interpolate=True)
-                self.fills[key] = (fill1, fill2)
-                self.data_buffer[key] = list(buf)
-                # タイトルを設定
-                if key == 'p_bins_spk1_bin12':
-                    ax.set_title('p_bins Speaker1 Bin1-2 Average')
-                elif key == 'p_bins_spk1_bin34':
-                    ax.set_title('p_bins Speaker1 Bin3-4 Average')
-                elif key == 'p_bins_spk2_bin12':
-                    ax.set_title('p_bins Speaker2 Bin1-2 Average')
-                elif key == 'p_bins_spk2_bin34':
-                    ax.set_title('p_bins Speaker2 Bin3-4 Average')
-                ax.set_xlim(-self.shown_context_sec, 0)
-                ax.set_ylim(0, 1)
             elif key.startswith('p_'):
                 color = color_map.get(key, 'green')
                 th = th_map.get(key, 0.5)
@@ -640,30 +627,6 @@ class GuiPlot:
                     fill1 = ax.fill_between(time_x, y1=0.5, y2=arr, where=arr > 0.5, color='y', interpolate=True)
                     fill2 = ax.fill_between(time_x, y1=arr, y2=0.5, where=arr < 0.5, color='b', interpolate=True)
                     self.fills[key] = [fill1, fill2]
-            elif key in ['p_bins_spk1_bin12', 'p_bins_spk1_bin34', 'p_bins_spk2_bin12', 'p_bins_spk2_bin34'] and key in self.fills:
-                buf = self.data_buffer[key]
-                # valはスカラー値なので、直接floatに変換
-                val_float = float(val) if isinstance(val, (int, float, np.floating, np.integer)) else float(val[0])
-                buf = buf + [val_float]
-                if len(buf) > self.MAX_CONTEXT_LEN:
-                    buf = buf[-self.MAX_CONTEXT_LEN:]
-                self.data_buffer[key] = buf
-                if draw:
-                    time_x = np.linspace(-self.shown_context_sec, 0, self.MAX_CONTEXT_LEN)
-                    ax = self.axes[key]
-                    arr = np.array(buf)
-                    fills = self.fills[key]
-                    for f in fills:
-                        if f is not None:
-                            f.remove()
-                    # 話者1は黄色が上、話者2は青色が上
-                    if 'spk1' in key:
-                        fill1 = ax.fill_between(time_x, y1=0.5, y2=arr, where=arr > 0.5, color='y', interpolate=True)
-                        fill2 = ax.fill_between(time_x, y1=arr, y2=0.5, where=arr < 0.5, color='b', interpolate=True)
-                    else:
-                        fill1 = ax.fill_between(time_x, y1=0.5, y2=arr, where=arr > 0.5, color='b', interpolate=True)
-                        fill2 = ax.fill_between(time_x, y1=arr, y2=0.5, where=arr < 0.5, color='y', interpolate=True)
-                    self.fills[key] = [fill1, fill2]
             elif key == 'p_bins' and key in self.patches:
                 arr = np.array(val, dtype=float)
                 if arr.ndim == 2 and arr.shape[0] == 2:
@@ -696,22 +659,11 @@ class GuiPlot:
                             if texts[s][b] is not None:
                                 texts[s][b].set_text(f'{v:.2f}')
                                 # 背景色に応じてテキスト色を調整
-                                text_color = 'white' if v > 0.5 else 'black'
+                                bg = cmap(v)
+                                luminance = 0.2126 * bg[0] + 0.7152 * bg[1] + 0.0722 * bg[2]
+                                text_color = 'white' if luminance < 0.5 else 'black'
                                 texts[s][b].set_color(text_color)
                     self.data_buffer[key] = arr
-                    
-                    # 各話者のビン1-2とビン3-4の平均を計算して更新
-                    if arr.shape[1] >= 4:
-                        p_bins_spk1_bin12 = float(np.mean(arr[0, 0:2]))
-                        p_bins_spk1_bin34 = float(np.mean(arr[0, 2:4]))
-                        p_bins_spk2_bin12 = float(np.mean(arr[1, 0:2]))
-                        p_bins_spk2_bin34 = float(np.mean(arr[1, 2:4]))
-                        
-                        # 平均値をresultに追加（次のループで処理される）
-                        result['p_bins_spk1_bin12'] = p_bins_spk1_bin12
-                        result['p_bins_spk1_bin34'] = p_bins_spk1_bin34
-                        result['p_bins_spk2_bin12'] = p_bins_spk2_bin12
-                        result['p_bins_spk2_bin34'] = p_bins_spk2_bin34
             elif key.startswith('p_') and key in self.fills:
                 buf = self.data_buffer[key]
                 color = color_map.get(key, 'green')
