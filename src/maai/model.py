@@ -29,7 +29,7 @@ class Maai():
         lang: str,
         audio_ch1: Base,
         audio_ch2: Base,
-        frame_rate: int = 10,
+        frame_rate: float = 10,
         context_len_sec: int = 20,
         device: str = "cpu",
         # num_channels: int = 2,
@@ -138,10 +138,10 @@ class Maai():
         self._mic2_queue = self.mic2.subscribe()
 
         self.audio_contenxt_lim_sec = context_len_sec
-        self.frame_rate = frame_rate
+        self.frame_rate = float(frame_rate)
         
         # Context length of the audio embeddings (depends on frame rate)
-        self.audio_context_len = int(self.audio_contenxt_lim_sec * self.frame_rate)
+        self.audio_context_len = int(round(self.audio_contenxt_lim_sec * self.frame_rate))
         
         self.sampling_rate = 16000
         self.frame_contxt_padding = 320 # Independe from frame size
@@ -150,7 +150,7 @@ class Maai():
         # 10Hz -> 320 + 1600 samples
         # 20Hz -> 320 + 800 samples
         # 50Hz -> 320 + 320 samples
-        self.audio_frame_size = self.sampling_rate // self.frame_rate + self.frame_contxt_padding
+        self.audio_frame_size = int(round(self.sampling_rate / self.frame_rate)) + self.frame_contxt_padding
         
         self.current_x1_audio = []
         self.current_x2_audio = []
@@ -311,6 +311,7 @@ class Maai():
                 self.process_time_abs = time.time()
                 self.current_x1_audio = self.current_x1_audio[-self.frame_contxt_padding:].copy()
                 self.current_x2_audio = self.current_x2_audio[-self.frame_contxt_padding:].copy()
+                print("[Warning] No audio features extracted. Skipping this frame.")
                 return
 
             # Full model

@@ -6,7 +6,7 @@ BIN_TIMES: list = [0.2, 0.4, 0.6, 0.8]
 @dataclass
 class VapConfig:
     sample_rate: int = 16000
-    frame_hz: int = 10
+    frame_hz: float = 10.0
     bin_times: List[float] = field(default_factory=lambda: BIN_TIMES)
 
     # Encoder (training flag)

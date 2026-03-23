@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import einops
 import os
+import math
 import numpy as np
 from dataclasses import dataclass
 from typing import Optional
@@ -205,7 +206,7 @@ class EncoderCPC(nn.Module):
 class EncoderMimi(nn.Module):
     def __init__(
         self,
-        frame_hz: int = 10,
+        frame_hz: float = 10,
         freeze: bool = True,
         mimi_model_name: str = "kyutai/mimi",
         context_samples: int = 320,
@@ -237,7 +238,7 @@ class EncoderMimi(nn.Module):
         self.frame_hz_mimi = float(
             getattr(getattr(self.model, "quantizer", None), "frame_rate", 12.5)
         )
-        self.frame_hz = frame_hz
+        self.frame_hz = float(frame_hz)
         self.context_samples = int(context_samples)
         self._audio_resampler = _CausalStreamingResampler(
             orig_freq=16000.0,
@@ -454,6 +455,9 @@ class EncoderMimi(nn.Module):
             return embeddings
 
         if self.frame_hz is None or self.frame_hz <= 0:
+            return embeddings
+
+        if math.isclose(float(self.frame_hz), float(self.frame_hz_mimi), rel_tol=0.0, abs_tol=1e-6):
             return embeddings
 
         emb_t = embeddings.transpose(1, 2)

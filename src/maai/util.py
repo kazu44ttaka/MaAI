@@ -33,7 +33,15 @@ repo_ids = {
     # "vap_nod_jp_only_timing": "maai-kyoto/vap_nod_jp_only_timing",
 }
 
-def load_vap_model(mode: str, frame_rate: int, context_len_sec: float, language: str = "jp", device: str = "cpu", cache_dir: str = None, force_download: bool = False, encoder_type: str = "cpc"):
+def _format_frame_rate(frame_rate: float) -> str:
+    frame_rate = float(frame_rate)
+    if frame_rate.is_integer():
+        return str(int(frame_rate))
+    return f"{frame_rate:g}"
+
+
+def load_vap_model(mode: str, frame_rate: float, context_len_sec: float, language: str = "jp", device: str = "cpu", cache_dir: str = None, force_download: bool = False, encoder_type: str = "cpc"):
+    frame_rate_label = _format_frame_rate(frame_rate)
     encoder_suffix = ""
     if encoder_type == "mimi":
         encoder_suffix = "_mimi"
@@ -43,39 +51,39 @@ def load_vap_model(mode: str, frame_rate: int, context_len_sec: float, language:
     if mode == "vap":
         if language == "jp":
             repo_id = repo_ids["vap_jp"]
-            file_path = f"vap{encoder_suffix}_state_dict_jp_{frame_rate}hz_{int(context_len_sec*1000)}msec.pt"
+            file_path = f"vap{encoder_suffix}_state_dict_jp_{frame_rate_label}hz_{int(context_len_sec*1000)}msec.pt"
         
         elif language == "en":
             repo_id = repo_ids["vap_en"]
-            file_path = f"vap{encoder_suffix}_state_dict_en_{frame_rate}hz_{int(context_len_sec*1000)}msec.pt"
+            file_path = f"vap{encoder_suffix}_state_dict_en_{frame_rate_label}hz_{int(context_len_sec*1000)}msec.pt"
         
         elif language == "ch":
             repo_id = repo_ids["vap_ch"]
-            file_path = f"vap{encoder_suffix}_state_dict_ch_{frame_rate}hz_{int(context_len_sec*1000)}msec.pt"
+            file_path = f"vap{encoder_suffix}_state_dict_ch_{frame_rate_label}hz_{int(context_len_sec*1000)}msec.pt"
 
         elif language == "tri":
             repo_id = repo_ids["vap_tri"]
-            file_path = f"vap{encoder_suffix}_state_dict_tri_ecj_{frame_rate}hz_{int(context_len_sec*1000)}msec.pt"
+            file_path = f"vap{encoder_suffix}_state_dict_tri_ecj_{frame_rate_label}hz_{int(context_len_sec*1000)}msec.pt"
 
         elif language == "jp_kyoto":
             repo_id = repo_ids["vap_jp_kyoto"]
-            file_path = f"vap{encoder_suffix}_state_dict_jp_kyoto_{frame_rate}hz_{int(context_len_sec*1000)}msec.pt"
+            file_path = f"vap{encoder_suffix}_state_dict_jp_kyoto_{frame_rate_label}hz_{int(context_len_sec*1000)}msec.pt"
         
         elif language == "en_kyoto":
             repo_id = repo_ids["vap_en_kyoto"]
-            file_path = f"vap{encoder_suffix}_state_dict_en_kyoto_{frame_rate}hz_{int(context_len_sec*1000)}msec.pt"
+            file_path = f"vap{encoder_suffix}_state_dict_en_kyoto_{frame_rate_label}hz_{int(context_len_sec*1000)}msec.pt"
         
         elif language == "ch_kyoto":
             repo_id = repo_ids["vap_ch_kyoto"]
-            file_path = f"vap{encoder_suffix}_state_dict_ch_kyoto_{frame_rate}hz_{int(context_len_sec*1000)}msec.pt"
+            file_path = f"vap{encoder_suffix}_state_dict_ch_kyoto_{frame_rate_label}hz_{int(context_len_sec*1000)}msec.pt"
         
         elif language == "tri_kyoto":
             repo_id = repo_ids["vap_tri_kyoto"]
-            file_path = f"vap{encoder_suffix}_state_dict_tri_kyoto_{frame_rate}hz_{int(context_len_sec*1000)}msec.pt"
+            file_path = f"vap{encoder_suffix}_state_dict_tri_kyoto_{frame_rate_label}hz_{int(context_len_sec*1000)}msec.pt"
         
         elif language == "ca":
             repo_id = repo_ids["vap_ca"]
-            file_path = f"vap{encoder_suffix}_state_dict_ca_{frame_rate}hz_{int(context_len_sec*1000)}msec.pt"
+            file_path = f"vap{encoder_suffix}_state_dict_ca_{frame_rate_label}hz_{int(context_len_sec*1000)}msec.pt"
         
         else:
             supported_languages = ["jp", "en", "ch", "tri", "jp_kyoto", "en_kyoto", "ch_kyoto", "tri_kyoto"]
@@ -84,35 +92,35 @@ def load_vap_model(mode: str, frame_rate: int, context_len_sec: float, language:
     elif mode == "vap_mc":
         if language == "jp":
             repo_id = repo_ids["vap_mc_jp"]
-            file_path = f"vap_mc{encoder_suffix}_state_dict_jp_{frame_rate}hz_{int(context_len_sec*1000)}msec.pt"
+            file_path = f"vap_mc{encoder_suffix}_state_dict_jp_{frame_rate_label}hz_{int(context_len_sec*1000)}msec.pt"
         
         elif language == "en":
             repo_id = repo_ids["vap_mc_en"]
-            file_path = f"vap_mc{encoder_suffix}_state_dict_en_{frame_rate}hz_{int(context_len_sec*1000)}msec.pt"
+            file_path = f"vap_mc{encoder_suffix}_state_dict_en_{frame_rate_label}hz_{int(context_len_sec*1000)}msec.pt"
         
         elif language == "ch":
             repo_id = repo_ids["vap_mc_ch"]
-            file_path = f"vap_mc{encoder_suffix}_state_dict_ch_{frame_rate}hz_{int(context_len_sec*1000)}msec.pt"
+            file_path = f"vap_mc{encoder_suffix}_state_dict_ch_{frame_rate_label}hz_{int(context_len_sec*1000)}msec.pt"
         
         elif language == "tri":
             repo_id = repo_ids["vap_mc_tri"]
-            file_path = f"vap_mc{encoder_suffix}_state_dict_tri_{frame_rate}hz_{int(context_len_sec*1000)}msec.pt"
+            file_path = f"vap_mc{encoder_suffix}_state_dict_tri_{frame_rate_label}hz_{int(context_len_sec*1000)}msec.pt"
         
         elif language == "jp_kyoto":
             repo_id = repo_ids["vap_mc_jp_kyoto"]
-            file_path = f"vap_mc{encoder_suffix}_state_dict_jp_kyoto_{frame_rate}hz_{int(context_len_sec*1000)}msec.pt"
+            file_path = f"vap_mc{encoder_suffix}_state_dict_jp_kyoto_{frame_rate_label}hz_{int(context_len_sec*1000)}msec.pt"
         
         elif language == "en_kyoto":
             repo_id = repo_ids["vap_mc_en_kyoto"]
-            file_path = f"vap_mc{encoder_suffix}_state_dict_en_kyoto_{frame_rate}hz_{int(context_len_sec*1000)}msec.pt"
+            file_path = f"vap_mc{encoder_suffix}_state_dict_en_kyoto_{frame_rate_label}hz_{int(context_len_sec*1000)}msec.pt"
         
         elif language == "ch_kyoto":
             repo_id = repo_ids["vap_mc_ch_kyoto"]
-            file_path = f"vap_mc{encoder_suffix}_state_dict_ch_kyoto_{frame_rate}hz_{int(context_len_sec*1000)}msec.pt"
+            file_path = f"vap_mc{encoder_suffix}_state_dict_ch_kyoto_{frame_rate_label}hz_{int(context_len_sec*1000)}msec.pt"
         
         elif language == "tri_kyoto":
             repo_id = repo_ids["vap_mc_tri_kyoto"]
-            file_path = f"vap_mc{encoder_suffix}_state_dict_tri_kyoto_{frame_rate}hz_{int(context_len_sec*1000)}msec.pt"
+            file_path = f"vap_mc{encoder_suffix}_state_dict_tri_kyoto_{frame_rate_label}hz_{int(context_len_sec*1000)}msec.pt"
 
         else:
             supported_languages = ["jp", "en", "ch", "tri", "jp_kyoto", "en_kyoto", "ch_kyoto", "tri_kyoto"]
@@ -121,19 +129,19 @@ def load_vap_model(mode: str, frame_rate: int, context_len_sec: float, language:
     elif mode == "bc":
         if language == "jp":
             repo_id = repo_ids["vap_bc_jp"]
-            file_path = f"vap-bc{encoder_suffix}_state_dict_jp_{frame_rate}hz_{int(context_len_sec*1000)}msec.pt"
+            file_path = f"vap-bc{encoder_suffix}_state_dict_jp_{frame_rate_label}hz_{int(context_len_sec*1000)}msec.pt"
 
         elif language == "en":
             repo_id = repo_ids["vap_bc_en"]
-            file_path = f"vap-bc{encoder_suffix}_state_dict_en_{frame_rate}hz_{int(context_len_sec*1000)}msec.pt"
+            file_path = f"vap-bc{encoder_suffix}_state_dict_en_{frame_rate_label}hz_{int(context_len_sec*1000)}msec.pt"
         
         elif language == "ch":
             repo_id = repo_ids["vap_bc_ch"]
-            file_path = f"vap-bc{encoder_suffix}_state_dict_ch_{frame_rate}hz_{int(context_len_sec*1000)}msec.pt"
+            file_path = f"vap-bc{encoder_suffix}_state_dict_ch_{frame_rate_label}hz_{int(context_len_sec*1000)}msec.pt"
         
         elif language == "tri":
             repo_id = repo_ids["vap_bc_tri"]
-            file_path = f"vap-bc{encoder_suffix}_state_dict_tri_{frame_rate}hz_{int(context_len_sec*1000)}msec.pt"
+            file_path = f"vap-bc{encoder_suffix}_state_dict_tri_{frame_rate_label}hz_{int(context_len_sec*1000)}msec.pt"
         
         else:
             supported_languages = ["jp", "en", "ch", "tri"]
@@ -143,7 +151,7 @@ def load_vap_model(mode: str, frame_rate: int, context_len_sec: float, language:
         
         if language == "jp":
             repo_id = repo_ids["vap_bc_2type_jp"]
-            file_path = f"vap-bc-2type{encoder_suffix}_state_dict_jp_{frame_rate}hz_{int(context_len_sec*1000)}msec.pt"
+            file_path = f"vap-bc-2type{encoder_suffix}_state_dict_jp_{frame_rate_label}hz_{int(context_len_sec*1000)}msec.pt"
 
         # elif language == "en":
         #     repo_id = repo_ids["vap_bc_2type_en"]
@@ -157,11 +165,11 @@ def load_vap_model(mode: str, frame_rate: int, context_len_sec: float, language:
         
         if language == "jp":
             repo_id = repo_ids["vap_nod_jp"]
-            file_path = f"vap-nod{encoder_suffix}_state_dict_erica_{frame_rate}hz_{int(context_len_sec*1000)}msec.pt"
+            file_path = f"vap-nod{encoder_suffix}_state_dict_erica_{frame_rate_label}hz_{int(context_len_sec*1000)}msec.pt"
         
         elif language == "en":
             repo_id = repo_ids["vap_nod_en"]
-            file_path = f"vap-nod{encoder_suffix}_state_dict_erica_{frame_rate}hz_{int(context_len_sec*1000)}msec.pt"
+            file_path = f"vap-nod{encoder_suffix}_state_dict_erica_{frame_rate_label}hz_{int(context_len_sec*1000)}msec.pt"
         
         else:
             supported_languages = ["jp", "en", "tri"]
@@ -171,7 +179,7 @@ def load_vap_model(mode: str, frame_rate: int, context_len_sec: float, language:
 
         if language == "jp":
             repo_id = repo_ids["vap_prompt_jp"]
-            file_path = f"vap_prompt{encoder_suffix}_state_dict_jp_{frame_rate}hz_{int(context_len_sec*1000)}msec.pt"
+            file_path = f"vap_prompt{encoder_suffix}_state_dict_jp_{frame_rate_label}hz_{int(context_len_sec*1000)}msec.pt"
         
         else:
             supported_languages = ["jp"]

@@ -29,7 +29,7 @@ def test():
         frame_rate=10,
         audio_ch1=mic,
         audio_ch2=zero,
-        device="cuda",
+        device="cpu",
         encoder_type="mimi"
     )
 
@@ -37,7 +37,7 @@ def test():
 
     while True:
         result = maai.get_result()
-        output.update(result)
+        # output.update(result)
         
 if __name__ == "__main__":
     try:

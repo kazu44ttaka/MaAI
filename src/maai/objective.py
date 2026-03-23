@@ -7,15 +7,17 @@ from einops import rearrange
 from typing import Dict, List, Tuple, Union
 
 
-def bin_times_to_frames(bin_times: List[float], frame_hz: int) -> List[int]:
-    return (torch.tensor(bin_times) * frame_hz).long().tolist()
+def bin_times_to_frames(bin_times: List[float], frame_hz: float) -> List[int]:
+    frames = torch.tensor(bin_times, dtype=torch.float32) * float(frame_hz)
+    frames = torch.floor(frames + 0.5).clamp(min=1)
+    return frames.to(dtype=torch.long).tolist()
 
 
 class ProjectionWindow:
     def __init__(
         self,
         bin_times: List = [0.2, 0.4, 0.6, 0.8],
-        frame_hz: int = 50,
+        frame_hz: float = 50,
         threshold_ratio: float = 0.5,
     ):
         super().__init__()
@@ -150,7 +152,7 @@ class ObjectiveVAP(nn.Module):
     def __init__(
         self,
         bin_times: List[float] = [0.2, 0.4, 0.6, 0.8],
-        frame_hz: int = 50,
+        frame_hz: float = 50,
         threshold_ratio: float = 0.5,
     ):
         super().__init__()

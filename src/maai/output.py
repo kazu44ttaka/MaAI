@@ -319,12 +319,12 @@ class GuiBar:
         self.plt.pause(0.001)
         
 class GuiPlot:
-    def __init__(self, shown_context_sec: int = 10, frame_rate: int = 10, sample_rate: int = 16000, figsize=(14, 10), use_fixed_draw_rate: bool = True):
+    def __init__(self, shown_context_sec: int = 10, frame_rate: float = 10, sample_rate: int = 16000, figsize=(14, 10), use_fixed_draw_rate: bool = True):
         self.figsize = figsize
         self.shown_context_sec = shown_context_sec
-        self.frame_rate = frame_rate
+        self.frame_rate = float(frame_rate)
         self.sample_rate = sample_rate
-        self.MAX_CONTEXT_LEN = frame_rate * shown_context_sec
+        self.MAX_CONTEXT_LEN = int(round(self.frame_rate * shown_context_sec))
         self.MAX_CONTEXT_WAV_LEN = sample_rate * shown_context_sec
         self.plt = plt
         self.fig = None
@@ -468,7 +468,8 @@ class GuiPlot:
             val = result[key]
             if key in ['x1', 'x2'] and key in self.lines:
                 buf = self.data_buffer[key]
-                val = val[-self.sample_rate // self.frame_rate:]
+                frame_samples = max(1, int(round(self.sample_rate / self.frame_rate)))
+                val = val[-frame_samples:]
                 buf = buf + list(val)
                 if len(buf) > self.MAX_CONTEXT_WAV_LEN:
                     buf = buf[-self.MAX_CONTEXT_WAV_LEN:]
