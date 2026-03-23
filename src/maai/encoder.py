@@ -247,8 +247,6 @@ class EncoderMimi(nn.Module):
         self._mimi_padding_cache = None
         self._mimi_encoder_past_key_values = None
         self._frame_rate_conv_cache = None
-        self._stream_audio_buffer = None
-        self._stream_num_frames = 0
 
         self.output_dim = 512
         if hasattr(self.model, "config") and hasattr(self.model.config, "hidden_size"):
@@ -256,7 +254,7 @@ class EncoderMimi(nn.Module):
         elif hasattr(self.model, "config") and hasattr(self.model.config, "dimension"):
             self.output_dim = self.model.config.dimension
         self.dim = self.output_dim
-        self.downsample_ratio = int(round(16000 / self.frame_hz))
+        self.downsample_ratio = int(round(16000 / self.frame_hz)) if self.frame_hz else 0
 
         self.frame_rate_conv = CConv1d(
             in_channels=self.output_dim,
@@ -293,8 +291,6 @@ class EncoderMimi(nn.Module):
         self._mimi_padding_cache = None
         self._mimi_encoder_past_key_values = None
         self._frame_rate_conv_cache = None
-        self._stream_audio_buffer = None
-        self._stream_num_frames = 0
 
     def _fix_mimi_padding_buffers(self) -> None:
         for module in self.model.modules():
@@ -306,7 +302,7 @@ class EncoderMimi(nn.Module):
             if hasattr(module, "_pad1d") and not hasattr(module, "_pad1d_wrapped"):
                 original_pad1d = module._pad1d
 
-                def _pad1d_int(hidden_states, paddings, mode="constant", value=0.0):
+                def _pad1d_int(hidden_states, paddings, mode="constant", value=0.0, _orig=original_pad1d):
                     def _to_int(v):
                         if torch.is_tensor(v):
                             return int(v.item())
@@ -316,7 +312,7 @@ class EncoderMimi(nn.Module):
                         paddings = tuple(_to_int(v) for v in paddings)
                     else:
                         paddings = _to_int(paddings)
-                    return original_pad1d(hidden_states, paddings, mode=mode, value=value)
+                    return _orig(hidden_states, paddings, mode=mode, value=value)
 
                 module._pad1d = _pad1d_int
                 module._pad1d_wrapped = True
@@ -398,6 +394,23 @@ class EncoderMimi(nn.Module):
             align_corners=False,
         )
 
+    def _resample_audio_streaming(
+        self,
+        waveform: torch.Tensor,
+        finalize_stream: bool,
+    ) -> torch.Tensor:
+        waveform = self._audio_resampler.process(waveform)
+
+        if finalize_stream:
+            waveform_flush = self._audio_resampler.flush()
+            if waveform_flush.shape[-1] > 0:
+                waveform = torch.cat(
+                    [waveform, waveform_flush.to(dtype=waveform.dtype, device=waveform.device)],
+                    dim=-1,
+                )
+
+        return waveform
+
     def _apply_frame_rate_conv_streaming(self, emb_t: torch.Tensor) -> torch.Tensor:
         if emb_t.shape[-1] == 0:
             return emb_t
@@ -430,7 +443,13 @@ class EncoderMimi(nn.Module):
         self._frame_rate_conv_cache = conv_input[..., -cache_size:].detach()
         return out
 
-    def _align_frame_rate(self, embeddings: torch.Tensor, input_num_samples: int, streaming: bool) -> torch.Tensor:
+    def _align_frame_rate(
+        self,
+        embeddings: torch.Tensor,
+        input_num_samples: int,
+        streaming: bool,
+        finalize_stream: bool,
+    ) -> torch.Tensor:
         if embeddings.shape[1] == 0:
             return embeddings
 
@@ -440,6 +459,25 @@ class EncoderMimi(nn.Module):
         emb_t = embeddings.transpose(1, 2)
 
         if streaming:
+            if (
+                self._feature_resampler is None
+                or self._feature_resampler.orig_freq != float(self.frame_hz_mimi)
+                or self._feature_resampler.new_freq != float(self.frame_hz)
+            ):
+                self._feature_resampler = _CausalStreamingResampler(
+                    orig_freq=float(self.frame_hz_mimi),
+                    new_freq=float(self.frame_hz),
+                )
+
+            emb_t = self._feature_resampler.process(emb_t)
+            if finalize_stream:
+                emb_t_flush = self._feature_resampler.flush()
+                if emb_t_flush.shape[-1] > 0:
+                    emb_t = torch.cat(
+                        [emb_t, emb_t_flush.to(dtype=emb_t.dtype, device=emb_t.device)],
+                        dim=-1,
+                    )
+
             emb_t = self._apply_frame_rate_conv_streaming(emb_t)
         else:
             target_frames = max(1, int(round(input_num_samples * self.frame_hz / 16000.0)))
@@ -455,7 +493,7 @@ class EncoderMimi(nn.Module):
 
         return emb_t.transpose(1, 2)
 
-    def _encode_offline_prefix(self, waveform: torch.Tensor, resampling: bool = True) -> torch.Tensor:
+    def _encode_offline(self, waveform: torch.Tensor, resampling: bool = True) -> torch.Tensor:
         input_num_samples = int(waveform.shape[-1])
 
         if resampling:
@@ -469,6 +507,7 @@ class EncoderMimi(nn.Module):
             embeddings,
             input_num_samples=input_num_samples,
             streaming=False,
+            finalize_stream=True,
         )
 
     def forward(
@@ -493,43 +532,40 @@ class EncoderMimi(nn.Module):
 
         waveform = waveform.to(dtype=torch.float32)
 
-        input_num_samples = int(waveform.shape[-1])
-        use_streaming = streaming and not finalize_stream
+        if not streaming:
+            return self._encode_offline(waveform, resampling=resampling)
+
         overlap_context = self.context_samples if has_overlap_context else 0
+        if overlap_context > 0:
+            if waveform.shape[-1] <= overlap_context:
+                return waveform.new_zeros((waveform.shape[0], 0, self.output_dim))
+            waveform = waveform[..., overlap_context:]
 
-        if use_streaming and input_num_samples <= overlap_context:
+        input_num_samples = int(waveform.shape[-1])
+        if input_num_samples == 0:
             return waveform.new_zeros((waveform.shape[0], 0, self.output_dim))
 
-        if not use_streaming:
-            return self._encode_offline_prefix(waveform, resampling=resampling)
-
-        new_waveform = waveform[..., overlap_context:] if overlap_context > 0 else waveform
-        if new_waveform.shape[-1] == 0:
+        if resampling:
+            waveform = self._resample_audio_streaming(
+                waveform,
+                finalize_stream=finalize_stream,
+            )
+        elif waveform.shape[-1] == 0:
             return waveform.new_zeros((waveform.shape[0], 0, self.output_dim))
 
-        if (
-            self._stream_audio_buffer is None
-            or self._stream_audio_buffer.shape[0] != new_waveform.shape[0]
-            or self._stream_audio_buffer.shape[1] != new_waveform.shape[1]
-            or self._stream_audio_buffer.device != new_waveform.device
-            or self._stream_audio_buffer.dtype != new_waveform.dtype
-        ):
-            self._stream_audio_buffer = new_waveform.clone()
-            self._stream_num_frames = 0
-        else:
-            self._stream_audio_buffer = torch.cat([self._stream_audio_buffer, new_waveform], dim=-1)
+        if waveform.shape[-1] == 0:
+            return waveform.new_zeros((waveform.shape[0], 0, self.output_dim))
 
-        full_embeddings = self._encode_offline_prefix(
-            self._stream_audio_buffer,
-            resampling=resampling,
+        embeddings = self._encode_continuous_embeddings(waveform, streaming=True)
+        if embeddings.shape[1] == 0:
+            return waveform.new_zeros((waveform.shape[0], 0, self.output_dim))
+
+        return self._align_frame_rate(
+            embeddings,
+            input_num_samples=input_num_samples,
+            streaming=True,
+            finalize_stream=finalize_stream,
         )
-
-        if full_embeddings.shape[1] <= self._stream_num_frames:
-            return full_embeddings[:, :0]
-
-        new_embeddings = full_embeddings[:, self._stream_num_frames :, :]
-        self._stream_num_frames = full_embeddings.shape[1]
-        return new_embeddings
 
 
 def build_audio_encoder(conf, cpc_model: str = ""):

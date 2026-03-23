@@ -108,6 +108,15 @@ class Maai():
             self.vap.encoder2.downsample[1].bias = nn.Parameter(sd['encoder.downsample.1.bias'])
             self.vap.encoder2.downsample[2].ln.weight = nn.Parameter(sd['encoder.downsample.2.ln.weight'])
             self.vap.encoder2.downsample[2].ln.bias = nn.Parameter(sd['encoder.downsample.2.ln.bias'])
+        
+        # print(sd.keys())
+        # input("Model loaded. Press Enter to continue...")
+        if conf.encoder_type == "mimi" and 'encoder.frame_rate_conv.weight' in sd:
+            self.vap.encoder1.frame_rate_conv.weight = nn.Parameter(sd['encoder.frame_rate_conv.weight'])
+            self.vap.encoder1.frame_rate_conv.bias = nn.Parameter(sd['encoder.frame_rate_conv.bias'])
+            
+            self.vap.encoder2.frame_rate_conv.weight = nn.Parameter(sd['encoder.frame_rate_conv.weight'])
+            self.vap.encoder2.frame_rate_conv.bias = nn.Parameter(sd['encoder.frame_rate_conv.bias'])
 
         # Check for parameters that were not updated from their initial values
         for name, param in self.vap.named_parameters():
