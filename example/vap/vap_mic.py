@@ -26,7 +26,7 @@ def test():
     maai = Maai(
         mode="vap",
         lang="jp",
-        frame_rate=10,
+        frame_rate=12.5,
         audio_ch1=mic,
         audio_ch2=zero,
         device="cpu",
@@ -37,7 +37,7 @@ def test():
 
     while True:
         result = maai.get_result()
-        # output.update(result)
+        output.update(result)
         
 if __name__ == "__main__":
     try:

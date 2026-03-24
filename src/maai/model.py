@@ -43,6 +43,7 @@ class Maai():
     ):
 
         conf = VapConfig()
+        conf.frame_hz = float(frame_rate)
         conf.encoder_type = encoder_type
         conf.mimi_model_name = mimi_model_name
 
@@ -130,6 +131,7 @@ class Maai():
         self.vap = self.vap.eval()
         
         self.mode = mode
+        self.encoder_type = encoder_type
         self.mic1 = audio_ch1
         self.mic2 = audio_ch2
 
@@ -144,7 +146,10 @@ class Maai():
         self.audio_context_len = int(round(self.audio_contenxt_lim_sec * self.frame_rate))
         
         self.sampling_rate = 16000
-        self.frame_contxt_padding = 320 # Independe from frame size
+        if encoder_type == "mimi":
+            self.frame_contxt_padding = 640
+        else:
+            self.frame_contxt_padding = 320 # Independe from frame size
         
         # Frame size
         # 10Hz -> 320 + 1600 samples
@@ -197,6 +202,22 @@ class Maai():
             encoder = getattr(self.vap, encoder_name, None)
             if encoder is not None and hasattr(encoder, "reset_streaming_state"):
                 encoder.reset_streaming_state()
+
+    # def _increase_mimi_chunk_threshold(self, attempted_num_samples: int):
+    #     if self.encoder_type != "mimi":
+    #         return
+
+    #     previous_threshold = int(self.audio_frame_size)
+    #     next_threshold = int(attempted_num_samples) + int(Base.FRAME_SIZE)
+    #     if next_threshold <= self.audio_frame_size:
+    #         next_threshold = self.audio_frame_size + int(Base.FRAME_SIZE)
+
+    #     self.audio_frame_size = next_threshold
+    #     if self.audio_frame_size != previous_threshold:
+    #         print(
+    #             f"[Info] Mimi streaming chunk threshold adjusted: {previous_threshold} -> {self.audio_frame_size} samples "
+    #             f"({self.audio_frame_size / self.sampling_rate:.3f} sec)."
+    #         )
     
     def worker(self):
         
@@ -305,12 +326,30 @@ class Maai():
                 x1_ = x1_.to(self.device, non_blocking=True)
                 x2_ = x2_.to(self.device, non_blocking=True)
 
+            # try:
             e1, e2 = self.vap.encode_audio(x1_, x2_)
+            # except RuntimeError as exc:
+            #     short_chunk_error = (
+            #         self.encoder_type == "mimi"
+            #         and "Calculated padded input size per channel" in str(exc)
+            #         and "Kernel size can't be greater than actual input size" in str(exc)
+            #     )
+            #     if short_chunk_error:
+            #         self._increase_mimi_chunk_threshold(len(self.current_x1_audio))
+            #         self.process_time_abs = time.time()
+            #         return
+            #     raise
 
             if e1.shape[1] == 0 or e2.shape[1] == 0:
-                self.process_time_abs = time.time()
-                self.current_x1_audio = self.current_x1_audio[-self.frame_contxt_padding:].copy()
-                self.current_x2_audio = self.current_x2_audio[-self.frame_contxt_padding:].copy()
+                # if self.encoder_type == "mimi":
+                #     self._increase_mimi_chunk_threshold(len(self.current_x1_audio))
+                # self.process_time_abs = time.time()
+                if self.frame_contxt_padding > 0:
+                    self.current_x1_audio = self.current_x1_audio[-self.frame_contxt_padding:].copy()
+                    self.current_x2_audio = self.current_x2_audio[-self.frame_contxt_padding:].copy()
+                else:
+                    self.current_x1_audio = np.empty(0, dtype=np.float32)
+                    self.current_x2_audio = np.empty(0, dtype=np.float32)
                 print("[Warning] No audio features extracted. Skipping this frame.")
                 return
 
@@ -414,14 +453,21 @@ class Maai():
                 num_process_frame = len(self.list_process_time_context) / (time.time() - self.last_interval_time)
                 self.last_interval_time = time.time()
 
-                print(f'[{self.mode}] Average processing time: {ave_proc_time:.5f} [sec], #process/sec: {num_process_frame:.3f}')
+                perf_message = f'[{self.mode}] Average processing time: {ave_proc_time:.5f} [sec], #process/sec: {num_process_frame:.3f}'
+                if self.encoder_type == "mimi":
+                    perf_message += f', chunk_samples: {self.audio_frame_size}'
+                print(perf_message)
                 self.list_process_time_context.clear()  # clear() is faster than = []
             
             self.process_time_abs = time.time()
 
         # Keep only the last samples in the buffer (use views for efficiency)
-        self.current_x1_audio = self.current_x1_audio[-self.frame_contxt_padding:].copy()
-        self.current_x2_audio = self.current_x2_audio[-self.frame_contxt_padding:].copy()
+        if self.frame_contxt_padding > 0:
+            self.current_x1_audio = self.current_x1_audio[-self.frame_contxt_padding:].copy()
+            self.current_x2_audio = self.current_x2_audio[-self.frame_contxt_padding:].copy()
+        else:
+            self.current_x1_audio = np.empty(0, dtype=np.float32)
+            self.current_x2_audio = np.empty(0, dtype=np.float32)
     
     def get_result(self):
         return self.result_dict_queue.get()
