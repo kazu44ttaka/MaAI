@@ -80,6 +80,11 @@ while True:
     maai_output_bar.update(result)
 ```
 
+`Maai` now accepts `model_type` to select the model variant.
+
+- `"normal"`: the existing default model variant used in previous releases
+- `"normal-ver2"`: a new model variant that uses the Mimi encoder
+
 <br>
 
 ## 🧩 Models
@@ -245,6 +250,10 @@ https://aclanthology.org/2025.naacl-long.367/<br>
 
 The source code in this repository is licensed under the MIT License.
 For the trained models, please follow the license described in the README of each model or on Hugging Face repository.
+
+When you use `model_type="normal-ver2"`, MaAI uses the Mimi encoder.
+Mimi is available at https://huggingface.co/kyutai/mimi and is licensed under CC BY 4.0.
+MaAI uses Mimi as an encoder without modifying Mimi itself, and combines it with a separate downstream model.
 
 The pre-trained CPC model is from the original CPC project and please follow its specific license.
 Refer to the original repository at https://github.com/facebookresearch/CPC_audio for more details.

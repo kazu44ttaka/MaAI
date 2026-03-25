@@ -26,11 +26,11 @@ def test():
     maai = Maai(
         mode="vap",
         lang="jp",
-        frame_rate=10,
+        frame_rate=12.5,
         audio_ch1=mic,
         audio_ch2=zero,
         device="cpu",
-        model_type="normal"
+        model_type="normal-ver2"
     )
 
     maai.start()

@@ -74,6 +74,11 @@ while True:
     maai_output_bar.update(result)
 ```
 
+`Maai` のモデル種別指定には `model_type` を使います。
+
+- `"normal"`: これまでのリリースで使っていた既存の標準モデル
+- `"normal-ver2"`: Mimi encoder を利用する新しいモデル
+
 <br>
 
 ## 🧩 モデル
@@ -238,6 +243,10 @@ https://aclanthology.org/2025.naacl-long.367/<br>
 
 本リポジトリのソースコードはMITライセンスです。
 学習済みモデルは各モデルのREADMEまたはHugging Faceに記載されたライセンスに従います。
+
+`model_type="normal-ver2"` を利用する場合、MaAI は Mimi encoder を使用します。
+Mimi は https://huggingface.co/kyutai/mimi で公開されており、ライセンスは CC BY 4.0 です。
+MaAI では Mimi 自体は改変せず、そのままエンコーダとして利用し、別の下流モデルと結合して使用しています。
 
 CPCモデルはオリジナルCPCプロジェクト由来です。
 ライセンスの詳細は以下を参照してください：

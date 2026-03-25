@@ -1,6 +1,11 @@
 import torch
 from huggingface_hub import hf_hub_download, list_repo_files
 
+MODEL_TYPE_TO_ENCODER_TYPE = {
+    "normal": "cpc",
+    "normal-ver2": "mimi",
+}
+
 repo_ids = {
     "vap_jp": "maai-kyoto/vap_jp",
     "vap_en": "maai-kyoto/vap_en",
@@ -40,8 +45,19 @@ def _format_frame_rate(frame_rate: float) -> str:
     return f"{frame_rate:g}"
 
 
-def load_vap_model(mode: str, frame_rate: float, context_len_sec: float, language: str = "jp", device: str = "cpu", cache_dir: str = None, force_download: bool = False, encoder_type: str = "cpc"):
+def resolve_encoder_type(model_type: str = "normal") -> str:
+    try:
+        return MODEL_TYPE_TO_ENCODER_TYPE[model_type]
+    except KeyError as exc:
+        supported_model_types = list(MODEL_TYPE_TO_ENCODER_TYPE.keys())
+        raise ValueError(
+            f"Unsupported model_type: {model_type}. Supported model_type values are: {supported_model_types}"
+        ) from exc
+
+
+def load_vap_model(mode: str, frame_rate: float, context_len_sec: float, language: str = "jp", device: str = "cpu", cache_dir: str = None, force_download: bool = False, model_type: str = "normal"):
     frame_rate_label = _format_frame_rate(frame_rate)
+    encoder_type = resolve_encoder_type(model_type)
     encoder_suffix = ""
     if encoder_type == "mimi":
         encoder_suffix = "_mimi"

@@ -8,7 +8,7 @@ import copy
 import os
 
 from .input import Base
-from .util import load_vap_model
+from .util import load_vap_model, resolve_encoder_type
 from .models.vap import VapGPT
 from .models.vap_bc import VapGPT_bc
 from .models.vap_bc_2type import VapGPT_bc_2type
@@ -34,13 +34,15 @@ class Maai():
         device: str = "cpu",
         # num_channels: int = 2,
         cpc_model: str = os.path.expanduser("~/.cache/cpc/60k_epoch4-d0f474de.pt"),
-        encoder_type: str = "cpc",
+        model_type: str = "normal",
         mimi_model_name: str = "kyutai/mimi",
         cache_dir: str = None,
         force_download: bool = False,
         use_kv_cache: bool = True,
         local_model = None,
     ):
+
+        encoder_type = resolve_encoder_type(model_type)
 
         conf = VapConfig()
         conf.frame_hz = float(frame_rate)
@@ -90,7 +92,7 @@ class Maai():
                 device,
                 cache_dir,
                 force_download,
-                encoder_type=conf.encoder_type,
+                model_type=model_type,
             )
         else:
             print("Loading model from local file:", local_model)
@@ -131,6 +133,7 @@ class Maai():
         self.vap = self.vap.eval()
         
         self.mode = mode
+        self.model_type = model_type
         self.encoder_type = encoder_type
         self.mic1 = audio_ch1
         self.mic2 = audio_ch2
