@@ -149,13 +149,11 @@ class Maai():
         self.audio_context_len = int(round(self.audio_contenxt_lim_sec * self.frame_rate))
         
         self.sampling_rate = 16000
-        if encoder_type == "mimi":
-            self.frame_contxt_padding = 640
-        else:
-            self.frame_contxt_padding = 320 # Independe from frame size
+        self.frame_contxt_padding = 320
         
         # Frame size
         # 10Hz -> 320 + 1600 samples
+        # 12.5Hz -> 320 + 1280 samples
         # 20Hz -> 320 + 800 samples
         # 50Hz -> 320 + 320 samples
         self.audio_frame_size = int(round(self.sampling_rate / self.frame_rate)) + self.frame_contxt_padding

@@ -248,6 +248,7 @@ class EncoderMimi(nn.Module):
         self._mimi_padding_cache = None
         self._mimi_encoder_past_key_values = None
         self._frame_rate_conv_cache = None
+        self._mimi_did_first_24k_leading_zeros = False
 
         self.output_dim = 512
         if hasattr(self.model, "config") and hasattr(self.model.config, "hidden_size"):
@@ -292,6 +293,7 @@ class EncoderMimi(nn.Module):
         self._mimi_padding_cache = None
         self._mimi_encoder_past_key_values = None
         self._frame_rate_conv_cache = None
+        self._mimi_did_first_24k_leading_zeros = False
 
     def _fix_mimi_padding_buffers(self) -> None:
         for module in self.model.modules():
@@ -554,6 +556,19 @@ class EncoderMimi(nn.Module):
                 waveform,
                 finalize_stream=finalize_stream,
             )
+            # Causal streaming resampler (16 kHz -> 24 kHz): the first chunk is one sample
+            # short of Mimi's expected input length (e.g. 1920); prepend a single zero once.
+            if (
+                not self._mimi_did_first_24k_leading_zeros
+                and waveform.shape[-1] > 0
+            ):
+                pad = waveform.new_zeros(
+                    waveform.shape[0],
+                    waveform.shape[1],
+                    1,
+                )
+                waveform = torch.cat([pad, waveform], dim=-1)
+                self._mimi_did_first_24k_leading_zeros = True
         elif waveform.shape[-1] == 0:
             return waveform.new_zeros((waveform.shape[0], 0, self.output_dim))
 
