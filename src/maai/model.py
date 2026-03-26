@@ -36,6 +36,9 @@ class Maai():
         cpc_model: str = os.path.expanduser("~/.cache/cpc/60k_epoch4-d0f474de.pt"),
         model_type: str = "normal",
         mimi_model_name: str = "kyutai/mimi",
+        use_mimi_onnx: bool = True,
+        mimi_onnx_cpu_intra_threads: int | None = None,
+        mimi_onnx_cpu_inter_threads: int | None = None,
         cache_dir: str = None,
         force_download: bool = False,
         use_kv_cache: bool = True,
@@ -48,6 +51,11 @@ class Maai():
         conf.frame_hz = float(frame_rate)
         conf.encoder_type = encoder_type
         conf.mimi_model_name = mimi_model_name
+        conf.mimi_use_onnx = 1 if bool(use_mimi_onnx) else 0
+        if mimi_onnx_cpu_intra_threads is not None:
+            conf.mimi_onnx_cpu_intra_threads = int(mimi_onnx_cpu_intra_threads)
+        if mimi_onnx_cpu_inter_threads is not None:
+            conf.mimi_onnx_cpu_inter_threads = int(mimi_onnx_cpu_inter_threads)
 
         # # Middle size model
         # if "middle" in lang:
@@ -98,6 +106,8 @@ class Maai():
             print("Loading model from local file:", local_model)
             sd = torch.load(local_model, map_location="cpu")
         
+        if hasattr(self.vap, "conf"):
+            setattr(self.vap.conf, "runtime_device", self.device)
         self.vap.load_encoder(cpc_model=cpc_model)
         self.vap.load_state_dict(sd, strict=False)
 
@@ -317,7 +327,7 @@ class Maai():
         x1_dist = x1_proc[self.frame_contxt_padding:]
         x2_dist = x2_proc[self.frame_contxt_padding:]
 
-        with torch.no_grad():
+        with torch.inference_mode():
             # Create tensors more efficiently with specified dtype and device
             x1_ = torch.from_numpy(x1_proc).float().unsqueeze(0).unsqueeze(0)
             x2_ = torch.from_numpy(x2_proc).float().unsqueeze(0).unsqueeze(0)

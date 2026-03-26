@@ -30,7 +30,8 @@ def test():
         audio_ch1=mic,
         audio_ch2=zero,
         device="cpu",
-        model_type="normal-ver2"
+        model_type="normal-ver2",
+        use_mimi_onnx=True,
     )
 
     maai.start()
