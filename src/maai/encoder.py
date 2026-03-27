@@ -818,8 +818,39 @@ class EncoderMimiOnnx(EncoderMimi):
         self._onnx_wave_shape = (1, 1, wave_len)
         dtype = np.float32
         wave = np.zeros(self._onnx_wave_shape, dtype=dtype)
-        pad = [np.zeros(tuple(s), dtype=dtype) for s in spec["padding_cache_shapes"]]
-        past = [np.zeros(tuple(s), dtype=dtype) for s in spec["past_key_value_shapes"]]
+
+        # ONNX session input metadata: used to derive correct rank & static
+        # dims for past KV cache inputs (dynamic seq-len dim set to 0).
+        onnx_input_map = {inp.name: inp for inp in self._onnx_sess.get_inputs()}
+
+        def _zero_from_onnx_input(name: str) -> np.ndarray:
+            if name in onnx_input_map:
+                shape = []
+                for idx, dim in enumerate(onnx_input_map[name].shape):
+                    if isinstance(dim, int):
+                        shape.append(dim)
+                    elif idx == 0:
+                        shape.append(1)   # batch dimension must be 1
+                    else:
+                        shape.append(0)   # dynamic dims (e.g. seq_len) start empty
+                return np.zeros(tuple(shape), dtype=dtype)
+            return np.zeros((1, 1, 0, 1), dtype=dtype)
+
+        # Padding cache: use the live model probe which provides the correct
+        # non-zero padding sizes required by causal convolution layers.
+        probe_pad = [np.zeros(tuple(s), dtype=dtype) for s in spec["padding_cache_shapes"]]
+        pad = []
+        for i in range(self._onnx_num_pad):
+            if i < len(probe_pad):
+                pad.append(probe_pad[i])
+            else:
+                pad.append(_zero_from_onnx_input(self._onnx_pad_input_keys[i]))
+
+        # Past KV cache: always derive from ONNX session input metadata.
+        # These start empty (seq_len=0) and the probe result structure can
+        # vary across transformers versions (DynamicCache, SlidingWindowCache,
+        # etc.), so we avoid relying on it here.
+        past = [_zero_from_onnx_input(k) for k in self._onnx_past_input_keys]
         self._onnx_states = [*pad, *past]
 
         input_template = {"wave_24k": wave}
