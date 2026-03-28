@@ -372,25 +372,107 @@ class EncoderMimi(nn.Module):
         emit_16k = self.get_streaming_emit_samples_16k()
         return int(round(float(emit_16k) * float(self.sample_rate) / 16000.0))
 
-    def _new_sliding_window_kv_cache(
+    def _new_transformer_cache(
         self,
         batch_size: int,
         device: torch.device,
         dtype: torch.dtype,
     ):
         try:
-            from transformers.cache_utils import SlidingWindowCache
+            from transformers.cache_utils import StaticCache
         except ModuleNotFoundError as exc:
-            raise ModuleNotFoundError(
-                "SlidingWindowCache requires transformers.cache_utils."
-            ) from exc
+            raise ModuleNotFoundError("Transformers cache_utils is required.") from exc
+        except ImportError:
+            StaticCache = None
+
+        cache_kwargs = {
+            "config": self.model.config,
+            "max_cache_len": mimi_sliding_cache_len(self.frame_hz_mimi),
+            "device": device,
+            "dtype": dtype,
+        }
+
+        if StaticCache is not None:
+            try:
+                return StaticCache(max_batch_size=int(batch_size), **cache_kwargs)
+            except TypeError:
+                return StaticCache(batch_size=int(batch_size), **cache_kwargs)
+
+        try:
+            from transformers.cache_utils import SlidingWindowCache
+        except (ModuleNotFoundError, ImportError) as exc:
+            raise ModuleNotFoundError("No compatible transformers cache class was found.") from exc
+
         return SlidingWindowCache(
-            config=self.model.config,
             max_batch_size=int(batch_size),
-            max_cache_len=mimi_sliding_cache_len(self.frame_hz_mimi),
-            device=device,
-            dtype=dtype,
+            **cache_kwargs,
         )
+
+    def _cache_to_legacy_layers(self, cache) -> tuple:
+        if cache is None:
+            return tuple()
+
+        if hasattr(cache, "to_legacy_cache"):
+            try:
+                legacy_cache = cache.to_legacy_cache()
+            except Exception:
+                legacy_cache = None
+            if legacy_cache is not None:
+                return tuple(
+                    (layer[0].detach().clone(), layer[1].detach().clone())
+                    for layer in legacy_cache
+                    if isinstance(layer, (tuple, list))
+                    and len(layer) >= 2
+                    and torch.is_tensor(layer[0])
+                    and torch.is_tensor(layer[1])
+                )
+
+        key_cache = getattr(cache, "key_cache", None)
+        value_cache = getattr(cache, "value_cache", None)
+        if key_cache is not None and value_cache is not None:
+            return tuple(
+                (key_cache[i].detach().clone(), value_cache[i].detach().clone())
+                for i in range(min(len(key_cache), len(value_cache)))
+            )
+
+        layers = getattr(cache, "layers", None)
+        if layers is not None:
+            legacy_layers = []
+            for layer in layers:
+                key_states = next(
+                    (
+                        getattr(layer, attr)
+                        for attr in ("keys", "key_states", "key_cache")
+                        if hasattr(layer, attr)
+                    ),
+                    None,
+                )
+                value_states = next(
+                    (
+                        getattr(layer, attr)
+                        for attr in ("values", "value_states", "value_cache")
+                        if hasattr(layer, attr)
+                    ),
+                    None,
+                )
+                if torch.is_tensor(key_states) and torch.is_tensor(value_states):
+                    legacy_layers.append(
+                        (key_states.detach().clone(), value_states.detach().clone())
+                    )
+            if legacy_layers:
+                return tuple(legacy_layers)
+
+        if isinstance(cache, (tuple, list)):
+            return tuple(
+                (layer[0].detach().clone(), layer[1].detach().clone())
+                for layer in cache
+                if isinstance(layer, (tuple, list))
+                and len(layer) >= 2
+                and torch.is_tensor(layer[0])
+                and torch.is_tensor(layer[1])
+            )
+
+        return tuple()
 
     def _probe_mimi_cache_templates(
         self,
@@ -427,7 +509,7 @@ class EncoderMimi(nn.Module):
             x_seq = emb.transpose(1, 2)
             t_len = int(x_seq.shape[1])
             cache_position = torch.arange(0, t_len, device=device, dtype=torch.long)
-            sw = self._new_sliding_window_kv_cache(batch_size, device, dtype)
+            sw = self._new_transformer_cache(batch_size, device, dtype)
             enc_out = self.model.encoder_transformer(
                 x_seq,
                 past_key_values=sw,
@@ -446,11 +528,7 @@ class EncoderMimi(nn.Module):
             else:
                 pad_templates.append(t.detach().clone())
 
-        pkv = enc_out.past_key_values
-        legacy_layers = tuple(
-            (pkv.key_cache[i].detach().clone(), pkv.value_cache[i].detach().clone())
-            for i in range(len(pkv.key_cache))
-        )
+        legacy_layers = self._cache_to_legacy_layers(enc_out.past_key_values)
         return pad_templates, legacy_layers
 
     def get_mimi_streaming_onnx_io_spec(
@@ -498,7 +576,7 @@ class EncoderMimi(nn.Module):
             past_key_values = self._mimi_encoder_past_key_values
             if past_key_values is None:
                 model_dtype = next(self.model.parameters()).dtype
-                past_key_values = self._new_sliding_window_kv_cache(
+                past_key_values = self._new_transformer_cache(
                     int(x.shape[0]),
                     x.device,
                     model_dtype,
