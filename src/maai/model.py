@@ -37,6 +37,11 @@ class Maai():
         model_type: str = "normal",
         mimi_model_name: str = "kyutai/mimi",
         use_mimi_onnx: bool = True,
+        mimi_onnx_precision: str = "fp32",
+        mimi_onnx_fp32_path: str | None = None,
+        mimi_onnx_fp32_meta_path: str | None = None,
+        mimi_onnx_int8_path: str | None = None,
+        mimi_onnx_int8_meta_path: str | None = None,
         mimi_onnx_cpu_intra_threads: int | None = None,
         mimi_onnx_cpu_inter_threads: int | None = None,
         cache_dir: str = None,
@@ -52,10 +57,24 @@ class Maai():
         conf.encoder_type = encoder_type
         conf.mimi_model_name = mimi_model_name
         conf.mimi_use_onnx = 1 if bool(use_mimi_onnx) else 0
+        precision = str(mimi_onnx_precision).strip().lower()
+        if precision not in {"fp32", "int8"}:
+            raise ValueError("mimi_onnx_precision must be 'fp32' or 'int8'.")
+        if str(device).startswith("cuda") and precision == "int8":
+            raise ValueError("mimi_onnx_precision='int8' is not supported with CUDA. Use 'fp32' on CUDA.")
+        conf.mimi_onnx_precision = precision
         if mimi_onnx_cpu_intra_threads is not None:
             conf.mimi_onnx_cpu_intra_threads = int(mimi_onnx_cpu_intra_threads)
         if mimi_onnx_cpu_inter_threads is not None:
             conf.mimi_onnx_cpu_inter_threads = int(mimi_onnx_cpu_inter_threads)
+        if mimi_onnx_fp32_path is not None:
+            conf.mimi_onnx_fp32_path = str(mimi_onnx_fp32_path)
+        if mimi_onnx_fp32_meta_path is not None:
+            conf.mimi_onnx_fp32_meta_path = str(mimi_onnx_fp32_meta_path)
+        if mimi_onnx_int8_path is not None:
+            conf.mimi_onnx_int8_path = str(mimi_onnx_int8_path)
+        if mimi_onnx_int8_meta_path is not None:
+            conf.mimi_onnx_int8_meta_path = str(mimi_onnx_int8_meta_path)
 
         # # Middle size model
         # if "middle" in lang:
@@ -145,6 +164,7 @@ class Maai():
         self.mode = mode
         self.model_type = model_type
         self.encoder_type = encoder_type
+        self._use_mimi_onnx = bool(use_mimi_onnx)
         self.mic1 = audio_ch1
         self.mic2 = audio_ch2
 
@@ -208,6 +228,7 @@ class Maai():
         self.e1_full = []
         self.e2_full = []
         self.vap_cache = None
+        self._skip_first_encoder_output = bool(self.encoder_type == "mimi" and self._use_mimi_onnx)
 
         for encoder_name in ["encoder1", "encoder2"]:
             encoder = getattr(self.vap, encoder_name, None)
@@ -362,6 +383,19 @@ class Maai():
                     self.current_x1_audio = np.empty(0, dtype=np.float32)
                     self.current_x2_audio = np.empty(0, dtype=np.float32)
                 print("[Warning] No audio features extracted. Skipping this frame.")
+                return
+
+            # Skip the first Mimi encoder output to avoid the startup-only mismatch
+            # between ONNX and PyTorch cache warmup behavior.
+            if self._skip_first_encoder_output:
+                self._skip_first_encoder_output = False
+                self.process_time_abs = time.time()
+                if self.frame_contxt_padding > 0:
+                    self.current_x1_audio = self.current_x1_audio[-self.frame_contxt_padding:].copy()
+                    self.current_x2_audio = self.current_x2_audio[-self.frame_contxt_padding:].copy()
+                else:
+                    self.current_x1_audio = np.empty(0, dtype=np.float32)
+                    self.current_x2_audio = np.empty(0, dtype=np.float32)
                 return
 
             # Full model

@@ -122,6 +122,11 @@ class _CausalStreamingResampler(nn.Module):
         self.state.out_total_samples = int(out_total_target)
         return y
 
+def mimi_sliding_cache_len(frame_hz_mimi: float) -> int:
+    """KV length for Mimi encoder_transformer: ~20s at Mimi frame rate, VAP-aligned (-1 frame)."""
+    return max(1, int(round(20.0 * float(frame_hz_mimi))) - 1)
+
+
 class EncoderCPC(nn.Module):
     """
     Encoder: waveform -> h
@@ -250,6 +255,7 @@ class EncoderMimi(nn.Module):
         self._feature_resampler = None
         self._mimi_padding_cache = None
         self._mimi_encoder_past_key_values = None
+        self._mimi_transformer_position_next = 0
         self._frame_rate_conv_cache = None
         self._mimi_did_first_24k_leading_zeros = False
 
@@ -295,6 +301,7 @@ class EncoderMimi(nn.Module):
             self._feature_resampler.reset()
         self._mimi_padding_cache = None
         self._mimi_encoder_past_key_values = None
+        self._mimi_transformer_position_next = 0
         self._frame_rate_conv_cache = None
         self._mimi_did_first_24k_leading_zeros = False
 
@@ -365,6 +372,26 @@ class EncoderMimi(nn.Module):
         emit_16k = self.get_streaming_emit_samples_16k()
         return int(round(float(emit_16k) * float(self.sample_rate) / 16000.0))
 
+    def _new_sliding_window_kv_cache(
+        self,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ):
+        try:
+            from transformers.cache_utils import SlidingWindowCache
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "SlidingWindowCache requires transformers.cache_utils."
+            ) from exc
+        return SlidingWindowCache(
+            config=self.model.config,
+            max_batch_size=int(batch_size),
+            max_cache_len=mimi_sliding_cache_len(self.frame_hz_mimi),
+            device=device,
+            dtype=dtype,
+        )
+
     def _probe_mimi_cache_templates(
         self,
         batch_size: int = 1,
@@ -394,13 +421,19 @@ class EncoderMimi(nn.Module):
             device=device,
             dtype=dtype,
         )
+
         with torch.inference_mode():
             emb = self.model.encoder(x, padding_cache=padding_cache)
+            x_seq = emb.transpose(1, 2)
+            t_len = int(x_seq.shape[1])
+            cache_position = torch.arange(0, t_len, device=device, dtype=torch.long)
+            sw = self._new_sliding_window_kv_cache(batch_size, device, dtype)
             enc_out = self.model.encoder_transformer(
-                emb.transpose(1, 2),
-                past_key_values=None,
+                x_seq,
+                past_key_values=sw,
                 use_cache=True,
                 return_dict=True,
+                cache_position=cache_position,
             )
             hidden = enc_out.last_hidden_state.transpose(1, 2)
             if self.model.downsample is not None:
@@ -412,7 +445,13 @@ class EncoderMimi(nn.Module):
                 pad_templates.append(torch.zeros((batch_size, 1, 0), device=device, dtype=dtype))
             else:
                 pad_templates.append(t.detach().clone())
-        return pad_templates, enc_out.past_key_values
+
+        pkv = enc_out.past_key_values
+        legacy_layers = tuple(
+            (pkv.key_cache[i].detach().clone(), pkv.value_cache[i].detach().clone())
+            for i in range(len(pkv.key_cache))
+        )
+        return pad_templates, legacy_layers
 
     def get_mimi_streaming_onnx_io_spec(
         self,
@@ -457,13 +496,33 @@ class EncoderMimi(nn.Module):
         if streaming:
             padding_cache = self._ensure_mimi_padding_cache()
             past_key_values = self._mimi_encoder_past_key_values
+            if past_key_values is None:
+                model_dtype = next(self.model.parameters()).dtype
+                past_key_values = self._new_sliding_window_kv_cache(
+                    int(x.shape[0]),
+                    x.device,
+                    model_dtype,
+                )
+                self._mimi_encoder_past_key_values = past_key_values
 
         embeddings = self.model.encoder(x, padding_cache=padding_cache)
+        xseq = embeddings.transpose(1, 2)
+        cache_position = None
+        if streaming:
+            t = int(xseq.shape[1])
+            cache_position = torch.arange(
+                self._mimi_transformer_position_next,
+                self._mimi_transformer_position_next + t,
+                device=xseq.device,
+                dtype=torch.long,
+            )
+            self._mimi_transformer_position_next += t
         encoder_outputs = self.model.encoder_transformer(
-            embeddings.transpose(1, 2),
+            xseq,
             past_key_values=past_key_values,
             use_cache=streaming,
             return_dict=True,
+            cache_position=cache_position,
         )
 
         if streaming:
@@ -672,8 +731,6 @@ class EncoderMimi(nn.Module):
                 )
                 waveform = torch.cat([pad, waveform], dim=-1)
                 self._mimi_did_first_24k_leading_zeros = True
-        elif waveform.shape[-1] == 0:
-            return waveform.new_zeros((waveform.shape[0], 0, self.output_dim))
 
         if waveform.shape[-1] == 0:
             return waveform.new_zeros((waveform.shape[0], 0, self.output_dim))
@@ -690,36 +747,26 @@ class EncoderMimi(nn.Module):
         )
 
 
-class _ReusableOrtRunner:
-    def __init__(self, ort, sess, input_template: dict[str, np.ndarray], use_cuda: bool):
-        self.sess = sess
-        self.io = sess.io_binding()
-        self.input_ortvalues = {}
-
-        for name, arr in input_template.items():
-            if use_cuda:
-                ov = ort.OrtValue.ortvalue_from_numpy(arr, "cuda", 0)
-            else:
-                ov = ort.OrtValue.ortvalue_from_numpy(arr, "cpu", 0)
-            self.io.bind_ortvalue_input(name, ov)
-            self.input_ortvalues[name] = ov
-
-        for out in sess.get_outputs():
-            self.io.bind_output(out.name, "cuda" if use_cuda else "cpu")
-
-    def run(self, ort_inputs: dict[str, np.ndarray]):
-        for name, arr in ort_inputs.items():
-            self.input_ortvalues[name].update_inplace(arr)
-        self.sess.run_with_iobinding(self.io)
-        return self.io.copy_outputs_to_cpu()
-
-
 class EncoderMimiOnnx(EncoderMimi):
     """
     Mimi core ONNX backend:
     - CUDA: FP32 ONNX + CUDA EP optimized + reusable IOBinding
     - CPU: INT8 ONNX
     """
+
+    @staticmethod
+    def _onnx_output_shape_for_fixed_bind(shape: list[Any] | tuple[Any, ...]) -> tuple[int, ...]:
+        """
+        ORT の動的次元（文字列や 0 以下）を 1 に置き換え、IOBinding 用の固定形状にする。
+        ストリーミング Mimi は通常 batch=1・1 ステップあたり emb_t=1。
+        """
+        resolved: list[int] = []
+        for d in shape:
+            if isinstance(d, int):
+                resolved.append(int(d) if d > 0 else 1)
+            else:
+                resolved.append(1)
+        return tuple(resolved)
 
     def __init__(
         self,
@@ -732,8 +779,6 @@ class EncoderMimiOnnx(EncoderMimi):
         runtime_device: str = "cpu",
         onnx_cpu_intra_threads: int = 2,
         onnx_cpu_inter_threads: int = 1,
-        onnx_reuse_input_dict: bool = True,
-        onnx_tune_cpu_threads: bool = True,
     ):
         super().__init__(
             frame_hz=frame_hz,
@@ -754,22 +799,35 @@ class EncoderMimiOnnx(EncoderMimi):
         self._use_cuda = self._runtime_device.startswith("cuda")
         self._onnx_model_path = str(onnx_model_path)
         self._onnx_meta_path = str(onnx_meta_path)
-        self._onnx_runner = None
         self._onnx_states: list[np.ndarray] = []
         self._onnx_input_names: list[str] = []
+        self._onnx_output_names: list[str] = []
         self._onnx_pad_input_keys: list[str] = []
         self._onnx_past_input_keys: list[str] = []
+        self._onnx_has_cache_position_input = False
+        self._onnx_has_cache_position_output = False
+        self._onnx_cache_position_key = "cache_position"
+        self._onnx_cache_position_out_key = "cache_position_out"
+        self._onnx_cache_position_start = np.int64(0)
+        self._onnx_cache_position_len = 1
+        self._onnx_cache_position_base = np.zeros((1,), dtype=np.int64)
+        self._onnx_cache_position_buffer = np.zeros((1,), dtype=np.int64)
+        self._onnx_init_past_from_template = True
         self._onnx_num_pad = 0
         self._onnx_wave_shape: tuple[int, ...] = (1, 1, 0)
         self._onnx_inputs: dict[str, np.ndarray] = {}
         self._onnx_cpu_intra_threads = int(onnx_cpu_intra_threads)
         self._onnx_cpu_inter_threads = int(onnx_cpu_inter_threads)
-        self._onnx_reuse_input_dict = bool(onnx_reuse_input_dict)
-        self._onnx_tune_cpu_threads = bool(onnx_tune_cpu_threads)
-        # Match PyTorch Mimi DynamicCache effective cap (sliding_window - 1).
-        sw = getattr(getattr(self, "model", None), "config", None)
-        sw_val = getattr(sw, "sliding_window", None) if sw is not None else None
-        self._onnx_max_past_len = int(sw_val - 1) if isinstance(sw_val, int) and sw_val > 0 else None
+        self._onnx_cuda_pad_slot0: list[Any] = []
+        self._onnx_cuda_pad_slot1: list[Any] = []
+        self._onnx_cuda_past_slot0: list[Any] = []
+        self._onnx_cuda_past_slot1: list[Any] = []
+        self._onnx_cuda_kv_ping = False
+        self._onnx_cuda_cp_base_t = torch.zeros((1,), dtype=torch.int64, device="cpu")
+        self._onnx_cuda_cp_buffer_t = torch.zeros((1,), dtype=torch.int64, device="cpu")
+        self._onnx_cuda_wave_buffer_t: Optional[torch.Tensor] = None
+        self._onnx_cuda_io = None
+        self._onnx_cuda_embeddings_ortvalue: Any = None
 
         self._onnx_sess = self._create_onnx_session()
         self._init_onnx_states()
@@ -790,9 +848,8 @@ class EncoderMimiOnnx(EncoderMimi):
             ]
         else:
             # Realtime-friendly default for CPU EP.
-            if self._onnx_tune_cpu_threads:
-                so.intra_op_num_threads = max(1, self._onnx_cpu_intra_threads)
-                so.inter_op_num_threads = max(1, self._onnx_cpu_inter_threads)
+            so.intra_op_num_threads = max(1, self._onnx_cpu_intra_threads)
+            so.inter_op_num_threads = max(1, self._onnx_cpu_inter_threads)
             providers = ["CPUExecutionProvider"]
         return self._ort.InferenceSession(self._onnx_model_path, sess_options=so, providers=providers)
 
@@ -804,14 +861,40 @@ class EncoderMimiOnnx(EncoderMimi):
 
     def _init_onnx_states(self):
         meta = self._load_meta()
+        required_params = meta.get("required_params", None)
+        expected_required = {
+            "frame_rate": 12.5,
+            "context_samples": 320,
+            "wave_16k_call_window": 1600,
+            "wave_24k_mimi_input": 1920,
+        }
+        if required_params is None:
+            raise RuntimeError(
+                "ONNX meta missing required_params. "
+                "Legacy meta format is no longer supported."
+            )
+        for k, v in expected_required.items():
+            got = required_params.get(k, None)
+            if got != v:
+                raise RuntimeError(
+                    f"ONNX meta required_params mismatch for {k}: got={got}, expected={v}"
+                )
+
         self._onnx_input_names = list(meta["input_names"])
+        self._onnx_output_names = list(meta.get("output_names", []))
+        self._onnx_has_cache_position_input = self._onnx_cache_position_key in self._onnx_input_names
+        self._onnx_has_cache_position_output = self._onnx_cache_position_out_key in self._onnx_output_names
+        self._onnx_cache_position_start = np.int64(0)
+        self._onnx_cache_position_len = int(meta.get("cache_position_len", 1))
+        cp_len = max(1, int(self._onnx_cache_position_len))
+        self._onnx_cache_position_base = np.arange(cp_len, dtype=np.int64)
+        self._onnx_cache_position_buffer = np.zeros((cp_len,), dtype=np.int64)
+        self._onnx_init_past_from_template = bool(meta.get("onnx_init_past_from_template", True))
         self._onnx_num_pad = int(meta["num_pad_tensors"])
         self._onnx_pad_input_keys = [f"pad_cache_{i}" for i in range(self._onnx_num_pad)]
-        n_states_total = len(self._onnx_input_names) - 1
+        n_states_total = len(self._onnx_input_names) - 1 - (1 if self._onnx_has_cache_position_input else 0)
         n_past = max(0, n_states_total - self._onnx_num_pad)
         self._onnx_past_input_keys = [f"past_{i}" for i in range(n_past)]
-        if "max_past_len" in meta and meta["max_past_len"] is not None:
-            self._onnx_max_past_len = int(meta["max_past_len"])
         spec = self.get_mimi_streaming_onnx_io_spec(batch_size=1)
 
         wave_len = int(meta["wave_24k_mimi_input"])
@@ -822,6 +905,13 @@ class EncoderMimiOnnx(EncoderMimi):
         # ONNX session input metadata: used to derive correct rank & static
         # dims for past KV cache inputs (dynamic seq-len dim set to 0).
         onnx_input_map = {inp.name: inp for inp in self._onnx_sess.get_inputs()}
+        missing_inputs = [name for name in self._onnx_input_names if name not in onnx_input_map]
+        if missing_inputs:
+            raise RuntimeError(
+                "ONNX input signature mismatch. Missing inputs in model session: "
+                f"{missing_inputs}. meta_input_names={self._onnx_input_names}, "
+                f"session_input_names={list(onnx_input_map.keys())}"
+            )
 
         def _zero_from_onnx_input(name: str) -> np.ndarray:
             if name in onnx_input_map:
@@ -850,40 +940,114 @@ class EncoderMimiOnnx(EncoderMimi):
         # These start empty (seq_len=0) and the probe result structure can
         # vary across transformers versions (DynamicCache, SlidingWindowCache,
         # etc.), so we avoid relying on it here.
+        self._onnx_past_init_time_dims: dict[str, int | None] = {}
+        contract = meta.get("contract", {})
+        past_template_shapes = contract.get("past_template_shapes", []) if isinstance(contract, dict) else []
+        for k in self._onnx_past_input_keys:
+            init_t = None
+            try:
+                idx = int(k.split("_", 1)[1])
+            except Exception:
+                idx = -1
+            if 0 <= idx < len(past_template_shapes):
+                shp = past_template_shapes[idx]
+                if isinstance(shp, list) and len(shp) >= 3 and isinstance(shp[-2], int):
+                    init_t = int(shp[-2])
+            self._onnx_past_init_time_dims[k] = init_t
         past = [_zero_from_onnx_input(k) for k in self._onnx_past_input_keys]
+        for i, k in enumerate(self._onnx_past_input_keys):
+            if past[i].ndim >= 3 and int(past[i].shape[-2]) == 0:
+                init_t = self._onnx_past_init_time_dims.get(k, None)
+                if self._onnx_init_past_from_template and isinstance(init_t, int) and init_t > 0:
+                    new_shape = list(past[i].shape)
+                    new_shape[-2] = init_t
+                    past[i] = np.zeros(tuple(new_shape), dtype=past[i].dtype)
         self._onnx_states = [*pad, *past]
 
         input_template = {"wave_24k": wave}
+        if self._onnx_has_cache_position_input:
+            np.add(
+                self._onnx_cache_position_base,
+                int(self._onnx_cache_position_start),
+                out=self._onnx_cache_position_buffer,
+                casting="unsafe",
+            )
+            input_template[self._onnx_cache_position_key] = self._onnx_cache_position_buffer
         for i, s in enumerate(self._onnx_states):
             if i < self._onnx_num_pad:
                 input_template[self._onnx_pad_input_keys[i]] = s
             else:
                 input_template[self._onnx_past_input_keys[i - self._onnx_num_pad]] = s
         self._onnx_inputs = dict(input_template)
-        self._onnx_runner = _ReusableOrtRunner(self._ort, self._onnx_sess, input_template, self._use_cuda)
+        if self._use_cuda:
+            pad_np = self._onnx_states[: self._onnx_num_pad]
+            past_np = self._onnx_states[self._onnx_num_pad :]
+            # Ping-pong GPU buffers: input and output are never the same OrtValue (matches
+            # separate-tensor semantics / avoids in-place races). No CPU KV round-trip.
+            self._onnx_cuda_pad_slot0 = [
+                self._ort.OrtValue.ortvalue_from_numpy(s, "cuda", 0) for s in pad_np
+            ]
+            self._onnx_cuda_pad_slot1 = [
+                self._ort.OrtValue.ortvalue_from_numpy(np.copy(s), "cuda", 0) for s in pad_np
+            ]
+            self._onnx_cuda_past_slot0 = [
+                self._ort.OrtValue.ortvalue_from_numpy(s, "cuda", 0) for s in past_np
+            ]
+            self._onnx_cuda_past_slot1 = [
+                self._ort.OrtValue.ortvalue_from_numpy(np.copy(s), "cuda", 0) for s in past_np
+            ]
+            self._onnx_cuda_kv_ping = False
+            cp_len = max(1, int(self._onnx_cache_position_len))
+            self._onnx_cuda_cp_base_t = torch.arange(cp_len, dtype=torch.int64, device="cuda")
+            self._onnx_cuda_cp_buffer_t = torch.zeros((cp_len,), dtype=torch.int64, device="cuda")
+            self._onnx_cuda_wave_buffer_t = torch.empty(
+                self._onnx_wave_shape,
+                dtype=torch.float32,
+                device="cuda",
+            )
+            self._onnx_cuda_io = self._onnx_sess.io_binding()
+            emb_name0 = self._onnx_output_names[0] if self._onnx_output_names else None
+            if emb_name0:
+                emb_meta = next(
+                    (o for o in self._onnx_sess.get_outputs() if o.name == emb_name0),
+                    None,
+                )
+                if emb_meta is not None and emb_meta.type == "tensor(float)":
+                    emb_shape = self._onnx_output_shape_for_fixed_bind(emb_meta.shape)
+                    self._onnx_cuda_embeddings_ortvalue = self._ort.OrtValue.ortvalue_from_shape_and_type(
+                        list(emb_shape),
+                        np.float32,
+                        "cuda",
+                        0,
+                    )
+                else:
+                    self._onnx_cuda_embeddings_ortvalue = None
+            else:
+                self._onnx_cuda_embeddings_ortvalue = None
+        else:
+            self._onnx_cuda_pad_slot0 = []
+            self._onnx_cuda_pad_slot1 = []
+            self._onnx_cuda_past_slot0 = []
+            self._onnx_cuda_past_slot1 = []
+            self._onnx_cuda_kv_ping = False
+            self._onnx_cuda_wave_buffer_t = None
+            self._onnx_cuda_io = None
+            self._onnx_cuda_embeddings_ortvalue = None
 
-    def _run_onnx_cuda_iobinding(self, ort_inputs: dict[str, np.ndarray]):
-        # Cache length grows in early streaming steps; rebuild bindings when input shape changes.
-        try:
-            return self._onnx_runner.run(ort_inputs)
-        except Exception:
-            self._onnx_runner = _ReusableOrtRunner(self._ort, self._onnx_sess, ort_inputs, use_cuda=True)
-            return self._onnx_runner.run(ort_inputs)
+    def _advance_cache_position(self, cp_out) -> None:
+        if cp_out is None:
+            if self._onnx_has_cache_position_input:
+                self._onnx_cache_position_start = np.int64(
+                    int(self._onnx_cache_position_start) + int(self._onnx_cache_position_len)
+                )
+            return
+        cp_arr = np.asarray(cp_out, dtype=np.int64).reshape(-1)
+        if cp_arr.size > 0:
+            self._onnx_cache_position_start = np.int64(cp_arr[-1])
 
     def reset_streaming_state(self):
         super().reset_streaming_state()
         self._init_onnx_states()
-
-    def _clip_past_len(self, x: np.ndarray) -> np.ndarray:
-        if self._onnx_max_past_len is None:
-            return x
-        if x.ndim < 3:
-            return x
-        # KV shape: [B, H, T, D], clip T axis (-2)
-        t = int(x.shape[-2])
-        if t <= self._onnx_max_past_len:
-            return x
-        return x[..., -self._onnx_max_past_len :, :]
 
     def _encode_continuous_embeddings(self, x: torch.Tensor, streaming: bool) -> torch.Tensor:
         if not streaming:
@@ -894,6 +1058,96 @@ class EncoderMimiOnnx(EncoderMimi):
             raise ValueError(f"EncoderMimiOnnx supports batch_size=1, got {x.shape[0]}")
 
         wave_t = x.detach()
+        if self._use_cuda:
+            if wave_t.device.type != "cuda":
+                wave_t = wave_t.to(device="cuda")
+            if wave_t.dtype != torch.float32:
+                wave_t = wave_t.to(dtype=torch.float32)
+            if not wave_t.is_contiguous():
+                wave_t = wave_t.contiguous()
+            if tuple(wave_t.shape) != self._onnx_wave_shape:
+                raise ValueError(
+                    f"ONNX Mimi input shape mismatch: got {tuple(wave_t.shape)}, "
+                    f"expected {self._onnx_wave_shape}. "
+                    "Adjusted path was removed; please provide fixed-length chunks."
+                )
+            if self._onnx_cuda_wave_buffer_t is None:
+                raise RuntimeError("CUDA wave buffer is not initialized.")
+            self._onnx_cuda_wave_buffer_t.copy_(wave_t, non_blocking=False)
+            if self._onnx_cuda_io is None:
+                self._onnx_cuda_io = self._onnx_sess.io_binding()
+
+            io = self._onnx_cuda_io
+            io.clear_binding_inputs()
+            io.clear_binding_outputs()
+            io.bind_input(
+                "wave_24k",
+                "cuda",
+                0,
+                np.float32,
+                tuple(self._onnx_cuda_wave_buffer_t.shape),
+                int(self._onnx_cuda_wave_buffer_t.data_ptr()),
+            )
+            if self._onnx_has_cache_position_input:
+                torch.add(
+                    self._onnx_cuda_cp_base_t,
+                    int(self._onnx_cache_position_start),
+                    out=self._onnx_cuda_cp_buffer_t,
+                )
+                io.bind_input(
+                    self._onnx_cache_position_key,
+                    "cuda",
+                    0,
+                    np.int64,
+                    tuple(self._onnx_cuda_cp_buffer_t.shape),
+                    int(self._onnx_cuda_cp_buffer_t.data_ptr()),
+                )
+            use_slot0_as_in = not self._onnx_cuda_kv_ping
+            pads_in = self._onnx_cuda_pad_slot0 if use_slot0_as_in else self._onnx_cuda_pad_slot1
+            pads_out = self._onnx_cuda_pad_slot1 if use_slot0_as_in else self._onnx_cuda_pad_slot0
+            pasts_in = self._onnx_cuda_past_slot0 if use_slot0_as_in else self._onnx_cuda_past_slot1
+            pasts_out = self._onnx_cuda_past_slot1 if use_slot0_as_in else self._onnx_cuda_past_slot0
+            for i in range(self._onnx_num_pad):
+                io.bind_ortvalue_input(self._onnx_pad_input_keys[i], pads_in[i])
+            for i in range(len(pasts_in)):
+                io.bind_ortvalue_input(self._onnx_past_input_keys[i], pasts_in[i])
+
+            emb_name = self._onnx_output_names[0] if self._onnx_output_names else None
+            if emb_name is None:
+                raise RuntimeError("ONNX output_names missing embedding output.")
+            if self._onnx_cuda_embeddings_ortvalue is not None:
+                io.bind_ortvalue_output(emb_name, self._onnx_cuda_embeddings_ortvalue)
+            else:
+                io.bind_output(emb_name, "cuda", 0)
+            # cache_position_out のランタイム形状は入力 cache_position と一致しない場合がある
+            # （例: メタ cache_position_len=2 でもグラフ出力は長さ 1）。固定バッファ bind は避ける。
+            if self._onnx_has_cache_position_output:
+                io.bind_output(self._onnx_cache_position_out_key, "cuda", 0)
+            for i in range(self._onnx_num_pad):
+                io.bind_ortvalue_output(f"pad_cache_out_{i}", pads_out[i])
+            for i in range(len(pasts_out)):
+                io.bind_ortvalue_output(f"past_out_{i}", pasts_out[i])
+
+            self._onnx_sess.run_with_iobinding(io)
+            io.synchronize_outputs()
+            out_vals = io.get_outputs()
+            self._onnx_cuda_kv_ping = not self._onnx_cuda_kv_ping
+
+            if self._onnx_has_cache_position_output and len(out_vals) > 1:
+                self._advance_cache_position(out_vals[1].numpy())
+            else:
+                self._advance_cache_position(None)
+
+            emb_ov = (
+                self._onnx_cuda_embeddings_ortvalue
+                if self._onnx_cuda_embeddings_ortvalue is not None
+                else out_vals[0]
+            )
+            emb_t = torch.from_numpy(emb_ov.numpy())
+            if x.device.type == "cuda":
+                emb_t = emb_t.to(device=x.device, dtype=torch.float32)
+            return emb_t
+
         if wave_t.device.type != "cpu":
             wave_t = wave_t.cpu()
         if wave_t.dtype != torch.float32:
@@ -907,30 +1161,30 @@ class EncoderMimiOnnx(EncoderMimi):
                 f"expected {self._onnx_wave_shape}. "
                 "Adjusted path was removed; please provide fixed-length chunks."
             )
-        if self._onnx_reuse_input_dict:
-            self._onnx_inputs["wave_24k"] = wave
-            ort_inputs = self._onnx_inputs
-        else:
-            ort_inputs = {"wave_24k": wave}
+        self._onnx_inputs["wave_24k"] = wave
+        if self._onnx_has_cache_position_input:
+            np.add(
+                self._onnx_cache_position_base,
+                int(self._onnx_cache_position_start),
+                out=self._onnx_cache_position_buffer,
+                casting="unsafe",
+            )
+            self._onnx_inputs[self._onnx_cache_position_key] = self._onnx_cache_position_buffer
+        ort_inputs = self._onnx_inputs
         for i in range(self._onnx_num_pad):
             ort_inputs[self._onnx_pad_input_keys[i]] = self._onnx_states[i]
         for i in range(self._onnx_num_pad, len(self._onnx_states)):
-            ort_inputs[self._onnx_past_input_keys[i - self._onnx_num_pad]] = self._clip_past_len(
-                self._onnx_states[i]
-            )
-        if self._use_cuda:
-            ort_out = self._run_onnx_cuda_iobinding(ort_inputs)
-        else:
-            ort_out = self._onnx_sess.run(None, ort_inputs)
+            past_name = self._onnx_past_input_keys[i - self._onnx_num_pad]
+            ort_inputs[past_name] = self._onnx_states[i]
+        ort_out = self._onnx_sess.run(None, ort_inputs)
         emb_np = ort_out[0]
-        # Keep variable-length cache states, but cap past len to match PyTorch.
-        new_states: list[np.ndarray] = []
-        for i, o in enumerate(ort_out[1:]):
-            if i < self._onnx_num_pad:
-                new_states.append(o)
-            else:
-                new_states.append(self._clip_past_len(o))
-        self._onnx_states = new_states
+        state_out_start = 1
+        if self._onnx_has_cache_position_output and len(ort_out) > 1:
+            self._advance_cache_position(ort_out[1])
+            state_out_start = 2
+        else:
+            self._advance_cache_position(None)
+        self._onnx_states = list(ort_out[state_out_start:])
         emb_t = torch.from_numpy(emb_np)
         if x.device.type == "cpu":
             return emb_t
@@ -950,18 +1204,24 @@ def build_audio_encoder(conf, cpc_model: str = ""):
     if encoder_type == "mimi":
         runtime_device = str(getattr(conf, "runtime_device", "cpu"))
         use_onnx = bool(int(getattr(conf, "mimi_use_onnx", 1)))
+        onnx_precision = str(getattr(conf, "mimi_onnx_precision", "fp32")).strip().lower()
+        if onnx_precision not in {"fp32", "int8"}:
+            raise ValueError(f"Unsupported mimi_onnx_precision: {onnx_precision}")
+        if runtime_device.startswith("cuda") and onnx_precision == "int8":
+            raise ValueError("mimi_onnx_precision='int8' is not supported with CUDA. Use 'fp32' on CUDA.")
+
         fp32_path = str(
             getattr(
                 conf,
                 "mimi_onnx_fp32_path",
-                "onnx/mimi_streaming_fp32.onnx",
+                "onnx/mimi_streaming_fp32_v3_sliding.onnx",
             )
         )
         int8_path = str(
             getattr(
                 conf,
                 "mimi_onnx_int8_path",
-                "onnx/mimi_streaming_int8_matmul.onnx",
+                "onnx/mimi_streaming_int8_matmul_v3_sliding.onnx",
             )
         )
         if not use_onnx:
@@ -985,30 +1245,28 @@ def build_audio_encoder(conf, cpc_model: str = ""):
                 f"{int8_path}.json",
             )
         )
-        if runtime_device.startswith("cuda"):
-            selected = fp32_path
-            selected_meta = fp32_meta
-        else:
+        if onnx_precision == "int8":
             selected = int8_path
             selected_meta = int8_meta
+        else:
+            selected = fp32_path
+            selected_meta = fp32_meta
 
         if not os.path.exists(selected):
             raise FileNotFoundError(f"Mimi ONNX model not found: {selected}")
         if not os.path.exists(selected_meta):
             raise FileNotFoundError(f"Mimi ONNX meta not found: {selected_meta}")
 
-        print(f"Using ONNX Mimi backend: {selected}")
+        print(f"Using ONNX Mimi backend ({onnx_precision}): {selected}")
         return EncoderMimiOnnx(
-            frame_hz=getattr(conf, "frame_hz", 10),
+            frame_hz=getattr(conf, "frame_hz", 12.5),
             freeze=conf.freeze_encoder,
             mimi_model_name=getattr(conf, "mimi_model_name", "kyutai/mimi"),
             onnx_model_path=selected,
             onnx_meta_path=selected_meta,
             runtime_device=runtime_device,
-            onnx_cpu_intra_threads=getattr(conf, "mimi_onnx_cpu_intra_threads", 2),
+            onnx_cpu_intra_threads=getattr(conf, "mimi_onnx_cpu_intra_threads", 4),
             onnx_cpu_inter_threads=getattr(conf, "mimi_onnx_cpu_inter_threads", 1),
-            onnx_reuse_input_dict=bool(int(getattr(conf, "mimi_onnx_reuse_input_dict", 1))),
-            onnx_tune_cpu_threads=bool(int(getattr(conf, "mimi_onnx_tune_cpu_threads", 1))),
         )
 
     raise ValueError(f"Unsupported encoder_type: {encoder_type}")

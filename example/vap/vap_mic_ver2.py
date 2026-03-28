@@ -32,6 +32,7 @@ def test():
         device="cpu",
         model_type="normal-ver2",
         use_mimi_onnx=True,
+        mimi_onnx_precision="fp32",
     )
 
     maai.start()
