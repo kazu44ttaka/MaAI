@@ -16,6 +16,143 @@ import time
 import copy
 
 
+def _hf_past_kv_per_layer_tuples(
+    past_key_values: Any,
+    *,
+    clone: bool,
+) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+    """
+    Normalize ``past_key_values`` to per-layer ``(key, value)`` pairs.
+
+    Supports: HF tuple layout ``((k,v), ...)``, and v5 ``StaticCache`` (``layers[*].keys`` / ``values``).
+    """
+    if past_key_values is None:
+        return tuple()
+
+    def _maybe_clone(t: torch.Tensor) -> torch.Tensor:
+        return t.detach().clone() if clone else t
+
+    if isinstance(past_key_values, (list, tuple)) and len(past_key_values) > 0:
+        el0 = past_key_values[0]
+        if (
+            isinstance(el0, (list, tuple))
+            and len(el0) == 2
+            and torch.is_tensor(el0[0])
+            and torch.is_tensor(el0[1])
+        ):
+            return tuple((_maybe_clone(a), _maybe_clone(b)) for a, b in past_key_values)
+
+    layers = getattr(past_key_values, "layers", None)
+    if layers is not None:
+        out: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for layer in layers:
+            keys = getattr(layer, "keys", None)
+            values = getattr(layer, "values", None)
+            if keys is None or values is None:
+                raise TypeError(
+                    f"Unsupported cache layer type {type(layer)} on {type(past_key_values)}"
+                )
+            out.append((_maybe_clone(keys), _maybe_clone(values)))
+        return tuple(out)
+
+    raise TypeError(f"Unsupported past_key_values type: {type(past_key_values)}")
+
+
+def _hf_flatten_past_kv_tensors(past_key_values: Any) -> tuple[torch.Tensor, ...]:
+    """Flatten past KV to (k0, v0, k1, v1, ...) for ONNX-style I/O."""
+    flat: list[torch.Tensor] = []
+    for k, v in _hf_past_kv_per_layer_tuples(past_key_values, clone=False):
+        flat.append(k)
+        flat.append(v)
+    return tuple(flat)
+
+
+def _hf_sync_static_cache_layer_after_kv_rebind(
+    layer: Any,
+    *,
+    cache_position_start: int | torch.Tensor | None,
+    onnx_export_trace: bool = False,
+) -> None:
+    """
+    After replacing ``layer.keys`` / ``layer.values`` on transformers v5 static layers,
+    align sequence bookkeeping with the same convention as ``Cache.update`` would maintain.
+
+    ``cache_position_start`` is the global index of the first position in the *current*
+    transformer step (i.e. total tokens already processed before this step). Pass a
+    0-dim ``torch.Tensor`` (e.g. ``cache_position.reshape(-1)[0]``) so ``torch.onnx.export``
+    can connect ``cache_position`` input to ``cumulative_length`` without constant-folding
+    ``int(tensor.item())`` to 0. When unknown, use ``None`` and derive a conservative value from buffer width.
+
+    ``onnx_export_trace``: when True (ONNX export wrappers only), skip the final ``cumulative_length`` ``fill_``
+    so the tensor keeps the value copied from ``cache_position_start`` (graph edge for export).
+    """
+    if not hasattr(layer, "cumulative_length_int"):
+        return
+    max_len = int(getattr(layer, "max_cache_len", 0) or 0)
+    if cache_position_start is not None:
+        if torch.is_tensor(cache_position_start):
+            t0 = cache_position_start.reshape(-1)[0]
+            cl = getattr(layer, "cumulative_length", None)
+            if isinstance(cl, torch.Tensor) and cl.numel() == 1:
+                cl.copy_(t0.to(dtype=cl.dtype))
+            # Keep int and tensor bookkeeping aligned. Forcing 0 here (export trace) while
+            # ``cumulative_length`` follows ``cache_position`` makes ``StaticSlidingWindowLayer``
+            # take the wrong branch vs. index_copy indices and breaks ORT at the sliding edge.
+            layer.cumulative_length_int = int(t0.detach().cpu().item())
+        else:
+            layer.cumulative_length_int = int(cache_position_start)
+    else:
+        # No global positions: assume a single-chunk alignment consistent with probe/export.
+        keys = getattr(layer, "keys", None)
+        if keys is None or not torch.is_tensor(keys):
+            return
+        w = int(keys.shape[-2])
+        layer.cumulative_length_int = min(w, max_len) if max_len > 0 else w
+    cl = getattr(layer, "cumulative_length", None)
+    if isinstance(cl, torch.Tensor) and cl.numel() == 1:
+        if (
+            onnx_export_trace
+            and cache_position_start is not None
+            and torch.is_tensor(cache_position_start)
+        ):
+            pass
+        else:
+            cl.fill_(int(layer.cumulative_length_int))
+
+
+def _hf_install_past_kv_layer(
+    cache: Any,
+    layer_idx: int,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cache_position_start: int | torch.Tensor | None = None,
+    onnx_export_trace: bool = False,
+) -> None:
+    """Rebind one layer's KV buffers on v5 ``StaticCache`` (``layers``) for ONNX export replay."""
+    layers = getattr(cache, "layers", None)
+    if layers is not None:
+        layer = layers[layer_idx]
+        layer.keys = k
+        layer.values = v
+        layer.is_initialized = True
+        # ``lazy_initialization`` is skipped when rebinding exported buffers; ``update()`` still needs ``device``.
+        if getattr(layer, "device", None) is None and torch.is_tensor(k):
+            layer.dtype = k.dtype
+            layer.device = k.device
+            cl = getattr(layer, "cumulative_length", None)
+            if torch.is_tensor(cl):
+                layer.cumulative_length = cl.to(device=k.device)
+        _hf_sync_static_cache_layer_after_kv_rebind(
+            layer,
+            cache_position_start=cache_position_start,
+            onnx_export_trace=onnx_export_trace,
+        )
+        return
+
+    raise TypeError(f"Cannot install KV into cache type {type(cache)}")
+
+
 @dataclass
 class _StreamingResamplerState:
     next_t_in_samples: float = 0.0
@@ -125,6 +262,66 @@ class _CausalStreamingResampler(nn.Module):
 def mimi_sliding_cache_len(frame_hz_mimi: float) -> int:
     """KV length for Mimi encoder_transformer: ~20s at Mimi frame rate, VAP-aligned (-1 frame)."""
     return max(1, int(round(20.0 * float(frame_hz_mimi))) - 1)
+
+
+def mimi_encoder_static_cache_max_len(frame_hz_mimi: float) -> int:
+    """
+    ``StaticCache(..., max_cache_len=...)`` for Mimi encoder streaming.
+
+    Must be **strictly greater** than :func:`mimi_sliding_cache_len` whenever a forward can pass
+    ``cache_position`` with length ``T>1``: ``StaticSlidingWindowLayer.update`` uses
+    ``arange(T) + cumulative_length`` for ``index_copy_`` into ``[B,H,L,D]`` with
+    ``L == min(config.sliding_window, max_cache_len)``. With ``L == mimi_sliding_cache_len`` and
+    ``T == 2``, the pair ``(L-2, L-1)`` is valid but ``(L-1, L)`` is not; one extra slot removes
+    ORT ``ScatterElements`` out-of-bounds at the sliding boundary without changing the exported
+    graph structure (still no Torch fallback at inference).
+
+    For kyutai/mimi (``sliding_window`` 250), ``mimi_sliding_cache_len`` is 249 and this returns 250,
+    matching the config sliding cap.
+    """
+    return mimi_sliding_cache_len(frame_hz_mimi) + 1
+
+
+def build_mimi_hf_cache_from_flat_past(
+    encoder: "EncoderMimi",
+    past_group_sizes: list[int],
+    state_tensors: tuple[torch.Tensor, ...],
+    ref: torch.Tensor,
+    *,
+    cache_position_start: int | torch.Tensor | None,
+    onnx_export_trace: bool = False,
+) -> Any:
+    """
+    Rebuild a HF KV cache from flattened per-layer K/V tensors.
+
+    Matches :class:`MimiStreamingOnnxWrapperV3CachePos` / ORT streaming so PyTorch v5 streaming
+    stays numerically aligned with ONNX.
+
+    Set ``onnx_export_trace=True`` only from ONNX export wrappers (``encoder_export``), not from
+    runtime :class:`EncoderMimi`.
+    """
+    device = ref.device
+    dtype = ref.dtype
+    cache_len = mimi_encoder_static_cache_max_len(encoder.frame_hz_mimi)
+    from transformers.cache_utils import StaticCache
+
+    cache = StaticCache(config=encoder.model.config, max_cache_len=cache_len)
+    idx = 0
+    for layer_idx, group_size in enumerate(past_group_sizes):
+        if group_size != 2:
+            raise ValueError(f"Expected K/V pair per layer, got group_size={group_size}")
+        k = state_tensors[idx].to(device=device, dtype=dtype)
+        v = state_tensors[idx + 1].to(device=device, dtype=dtype)
+        idx += 2
+        _hf_install_past_kv_layer(
+            cache,
+            layer_idx,
+            k,
+            v,
+            cache_position_start=cache_position_start,
+            onnx_export_trace=onnx_export_trace,
+        )
+    return cache
 
 
 class EncoderCPC(nn.Module):
@@ -254,10 +451,14 @@ class EncoderMimi(nn.Module):
         )
         self._feature_resampler = None
         self._mimi_padding_cache = None
-        self._mimi_encoder_past_key_values = None
         self._mimi_transformer_position_next = 0
         self._frame_rate_conv_cache = None
         self._mimi_did_first_24k_leading_zeros = False
+        # transformers v5+: same flat K/V contract as ONNX (rebind StaticCache each step).
+        self._mimi_streaming_flat_past: Optional[tuple[torch.Tensor, ...]] = None
+        self._mimi_streaming_past_group_sizes: Optional[list[int]] = None
+        self._mimi_zero_flat_past: Optional[tuple[torch.Tensor, ...]] = None
+        self._mimi_onnx_pad_seeded: bool = False
 
         self.output_dim = 512
         if hasattr(self.model, "config") and hasattr(self.model.config, "hidden_size"):
@@ -300,10 +501,13 @@ class EncoderMimi(nn.Module):
         if self._feature_resampler is not None:
             self._feature_resampler.reset()
         self._mimi_padding_cache = None
-        self._mimi_encoder_past_key_values = None
         self._mimi_transformer_position_next = 0
         self._frame_rate_conv_cache = None
         self._mimi_did_first_24k_leading_zeros = False
+        self._mimi_streaming_flat_past = None
+        self._mimi_streaming_past_group_sizes = None
+        self._mimi_zero_flat_past = None
+        self._mimi_onnx_pad_seeded = False
 
     def _fix_mimi_padding_buffers(self) -> None:
         for module in self.model.modules():
@@ -372,108 +576,6 @@ class EncoderMimi(nn.Module):
         emit_16k = self.get_streaming_emit_samples_16k()
         return int(round(float(emit_16k) * float(self.sample_rate) / 16000.0))
 
-    def _new_transformer_cache(
-        self,
-        batch_size: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ):
-        try:
-            from transformers.cache_utils import StaticCache
-        except ModuleNotFoundError as exc:
-            raise ModuleNotFoundError("Transformers cache_utils is required.") from exc
-        except ImportError:
-            StaticCache = None
-
-        cache_kwargs = {
-            "config": self.model.config,
-            "max_cache_len": mimi_sliding_cache_len(self.frame_hz_mimi),
-            "device": device,
-            "dtype": dtype,
-        }
-
-        if StaticCache is not None:
-            try:
-                return StaticCache(max_batch_size=int(batch_size), **cache_kwargs)
-            except TypeError:
-                return StaticCache(batch_size=int(batch_size), **cache_kwargs)
-
-        try:
-            from transformers.cache_utils import SlidingWindowCache
-        except (ModuleNotFoundError, ImportError) as exc:
-            raise ModuleNotFoundError("No compatible transformers cache class was found.") from exc
-
-        return SlidingWindowCache(
-            max_batch_size=int(batch_size),
-            **cache_kwargs,
-        )
-
-    def _cache_to_legacy_layers(self, cache) -> tuple:
-        if cache is None:
-            return tuple()
-
-        if hasattr(cache, "to_legacy_cache"):
-            try:
-                legacy_cache = cache.to_legacy_cache()
-            except Exception:
-                legacy_cache = None
-            if legacy_cache is not None:
-                return tuple(
-                    (layer[0].detach().clone(), layer[1].detach().clone())
-                    for layer in legacy_cache
-                    if isinstance(layer, (tuple, list))
-                    and len(layer) >= 2
-                    and torch.is_tensor(layer[0])
-                    and torch.is_tensor(layer[1])
-                )
-
-        key_cache = getattr(cache, "key_cache", None)
-        value_cache = getattr(cache, "value_cache", None)
-        if key_cache is not None and value_cache is not None:
-            return tuple(
-                (key_cache[i].detach().clone(), value_cache[i].detach().clone())
-                for i in range(min(len(key_cache), len(value_cache)))
-            )
-
-        layers = getattr(cache, "layers", None)
-        if layers is not None:
-            legacy_layers = []
-            for layer in layers:
-                key_states = next(
-                    (
-                        getattr(layer, attr)
-                        for attr in ("keys", "key_states", "key_cache")
-                        if hasattr(layer, attr)
-                    ),
-                    None,
-                )
-                value_states = next(
-                    (
-                        getattr(layer, attr)
-                        for attr in ("values", "value_states", "value_cache")
-                        if hasattr(layer, attr)
-                    ),
-                    None,
-                )
-                if torch.is_tensor(key_states) and torch.is_tensor(value_states):
-                    legacy_layers.append(
-                        (key_states.detach().clone(), value_states.detach().clone())
-                    )
-            if legacy_layers:
-                return tuple(legacy_layers)
-
-        if isinstance(cache, (tuple, list)):
-            return tuple(
-                (layer[0].detach().clone(), layer[1].detach().clone())
-                for layer in cache
-                if isinstance(layer, (tuple, list))
-                and len(layer) >= 2
-                and torch.is_tensor(layer[0])
-                and torch.is_tensor(layer[1])
-            )
-
-        return tuple()
-
     def _probe_mimi_cache_templates(
         self,
         batch_size: int = 1,
@@ -509,13 +611,19 @@ class EncoderMimi(nn.Module):
             x_seq = emb.transpose(1, 2)
             t_len = int(x_seq.shape[1])
             cache_position = torch.arange(0, t_len, device=device, dtype=torch.long)
-            sw = self._new_transformer_cache(batch_size, device, dtype)
+            from transformers.cache_utils import StaticCache
+
+            sw = StaticCache(
+                config=self.model.config,
+                max_cache_len=mimi_encoder_static_cache_max_len(self.frame_hz_mimi),
+            )
+            position_ids = cache_position.unsqueeze(0).expand(int(batch_size), -1)
             enc_out = self.model.encoder_transformer(
                 x_seq,
                 past_key_values=sw,
                 use_cache=True,
                 return_dict=True,
-                cache_position=cache_position,
+                position_ids=position_ids,
             )
             hidden = enc_out.last_hidden_state.transpose(1, 2)
             if self.model.downsample is not None:
@@ -528,8 +636,9 @@ class EncoderMimi(nn.Module):
             else:
                 pad_templates.append(t.detach().clone())
 
-        legacy_layers = self._cache_to_legacy_layers(enc_out.past_key_values)
-        return pad_templates, legacy_layers
+        pkv = enc_out.past_key_values
+        past_kv_layers = _hf_past_kv_per_layer_tuples(pkv, clone=True)
+        return pad_templates, past_kv_layers
 
     def get_mimi_streaming_onnx_io_spec(
         self,
@@ -567,25 +676,49 @@ class EncoderMimi(nn.Module):
             "output_dim": int(self.output_dim),
         }
 
+    def _seed_mimi_padding_cache_like_onnx(self, ref: torch.Tensor) -> None:
+        """
+        Match ``EncoderMimiOnnx`` / ORT init: zero-filled ``padding_cache`` slots with ONNX export shapes.
+
+        A fresh :class:`MimiConv1dPaddingCache` starts with empty buffers; ORT uses explicit zeros of the
+        contract shapes, which can diverge on the first streaming step.
+        """
+        if self._mimi_onnx_pad_seeded:
+            return
+        spec = self.get_mimi_streaming_onnx_io_spec(batch_size=int(ref.shape[0]))
+        pc = self._ensure_mimi_padding_cache()
+        for i, shp in enumerate(spec["padding_cache_shapes"]):
+            pc.padding_cache[i] = ref.new_zeros(shp)
+        if hasattr(pc, "per_layer_is_init"):
+            pc.per_layer_is_init = [True] * len(spec["padding_cache_shapes"])
+        self._mimi_onnx_pad_seeded = True
+
+    def _ensure_mimi_streaming_flat_templates(self, ref: torch.Tensor) -> None:
+        """Lazy-init zero flat K/V tensors (v5 streaming, ONNX-aligned)."""
+        if self._mimi_streaming_past_group_sizes is not None:
+            return
+        _pad, past_templates = self._probe_mimi_cache_templates(
+            batch_size=int(ref.shape[0]),
+            num_samples_24k=self.get_streaming_mimi_input_24k(),
+            device=ref.device,
+            dtype=ref.dtype,
+        )
+        flat: list[torch.Tensor] = []
+        for layer in past_templates:
+            for t in layer:
+                flat.append(torch.zeros(tuple(t.shape), device=ref.device, dtype=ref.dtype))
+        self._mimi_streaming_past_group_sizes = [len(layer) for layer in past_templates]
+        self._mimi_zero_flat_past = tuple(flat)
+
     def _encode_continuous_embeddings(self, x: torch.Tensor, streaming: bool) -> torch.Tensor:
         padding_cache = None
-        past_key_values = None
-
         if streaming:
             padding_cache = self._ensure_mimi_padding_cache()
-            past_key_values = self._mimi_encoder_past_key_values
-            if past_key_values is None:
-                model_dtype = next(self.model.parameters()).dtype
-                past_key_values = self._new_transformer_cache(
-                    int(x.shape[0]),
-                    x.device,
-                    model_dtype,
-                )
-                self._mimi_encoder_past_key_values = past_key_values
+            self._seed_mimi_padding_cache_like_onnx(x)
 
         embeddings = self.model.encoder(x, padding_cache=padding_cache)
         xseq = embeddings.transpose(1, 2)
-        cache_position = None
+
         if streaming:
             t = int(xseq.shape[1])
             cache_position = torch.arange(
@@ -594,17 +727,35 @@ class EncoderMimi(nn.Module):
                 device=xseq.device,
                 dtype=torch.long,
             )
-            self._mimi_transformer_position_next += t
-        encoder_outputs = self.model.encoder_transformer(
-            xseq,
-            past_key_values=past_key_values,
-            use_cache=streaming,
-            return_dict=True,
-            cache_position=cache_position,
-        )
-
-        if streaming:
-            self._mimi_encoder_past_key_values = encoder_outputs.past_key_values
+            self._ensure_mimi_streaming_flat_templates(x)
+            past_in = self._mimi_streaming_flat_past
+            if past_in is None:
+                past_in = self._mimi_zero_flat_past
+            assert past_in is not None and self._mimi_streaming_past_group_sizes is not None
+            past_key_values = build_mimi_hf_cache_from_flat_past(
+                self,
+                self._mimi_streaming_past_group_sizes,
+                past_in,
+                x,
+                cache_position_start=cache_position.reshape(-1)[0],
+            )
+            position_ids = cache_position.unsqueeze(0).expand(int(xseq.shape[0]), -1)
+            encoder_outputs = self.model.encoder_transformer(
+                xseq,
+                past_key_values=past_key_values,
+                use_cache=True,
+                return_dict=True,
+                position_ids=position_ids,
+            )
+            self._mimi_streaming_flat_past = tuple(_hf_flatten_past_kv_tensors(encoder_outputs.past_key_values))
+            self._mimi_transformer_position_next = int(encoder_outputs.past_key_values.get_seq_length())
+        else:
+            encoder_outputs = self.model.encoder_transformer(
+                xseq,
+                past_key_values=None,
+                use_cache=False,
+                return_dict=True,
+            )
 
         embeddings = encoder_outputs.last_hidden_state.transpose(1, 2)
         if self.model.downsample is not None:
@@ -827,7 +978,10 @@ class EncoderMimi(nn.Module):
 
 class EncoderMimiOnnx(EncoderMimi):
     """
-    Mimi core ONNX backend:
+    Mimi core ONNX backend (streaming contract matches ``transformers`` v5 ``StaticCache`` + flat K/V I/O).
+
+    Pair ``.onnx`` with its ``.json`` from ``export_mimi_streaming_onnx_v2.py`` in the same venv as runtime Torch.
+
     - CUDA: FP32 ONNX + CUDA EP optimized + reusable IOBinding
     - CPU: INT8 ONNX
     """
@@ -886,10 +1040,16 @@ class EncoderMimiOnnx(EncoderMimi):
         self._onnx_has_cache_position_output = False
         self._onnx_cache_position_key = "cache_position"
         self._onnx_cache_position_out_key = "cache_position_out"
+        self._onnx_has_position_ids_input = False
+        self._onnx_position_ids_key = "position_ids"
         self._onnx_cache_position_start = np.int64(0)
+        self._onnx_position_ids_start = np.int64(0)
         self._onnx_cache_position_len = 1
+        self._onnx_max_past_len = 1
         self._onnx_cache_position_base = np.zeros((1,), dtype=np.int64)
         self._onnx_cache_position_buffer = np.zeros((1,), dtype=np.int64)
+        self._onnx_position_ids_base = np.zeros((1,), dtype=np.int64)
+        self._onnx_position_ids_buffer = np.zeros((1,), dtype=np.int64)
         self._onnx_init_past_from_template = True
         self._onnx_num_pad = 0
         self._onnx_wave_shape: tuple[int, ...] = (1, 1, 0)
@@ -903,6 +1063,8 @@ class EncoderMimiOnnx(EncoderMimi):
         self._onnx_cuda_kv_ping = False
         self._onnx_cuda_cp_base_t = torch.zeros((1,), dtype=torch.int64, device="cpu")
         self._onnx_cuda_cp_buffer_t = torch.zeros((1,), dtype=torch.int64, device="cpu")
+        self._onnx_cuda_pos_base_t = torch.zeros((1,), dtype=torch.int64, device="cpu")
+        self._onnx_cuda_pos_buffer_t = torch.zeros((1,), dtype=torch.int64, device="cpu")
         self._onnx_cuda_wave_buffer_t: Optional[torch.Tensor] = None
         self._onnx_cuda_io = None
         self._onnx_cuda_embeddings_ortvalue: Any = None
@@ -962,15 +1124,25 @@ class EncoderMimiOnnx(EncoderMimi):
         self._onnx_output_names = list(meta.get("output_names", []))
         self._onnx_has_cache_position_input = self._onnx_cache_position_key in self._onnx_input_names
         self._onnx_has_cache_position_output = self._onnx_cache_position_out_key in self._onnx_output_names
+        self._onnx_has_position_ids_input = self._onnx_position_ids_key in self._onnx_input_names
         self._onnx_cache_position_start = np.int64(0)
+        self._onnx_position_ids_start = np.int64(0)
         self._onnx_cache_position_len = int(meta.get("cache_position_len", 1))
+        self._onnx_max_past_len = max(1, int(meta.get("max_past_len", 1)))
         cp_len = max(1, int(self._onnx_cache_position_len))
         self._onnx_cache_position_base = np.arange(cp_len, dtype=np.int64)
         self._onnx_cache_position_buffer = np.zeros((cp_len,), dtype=np.int64)
+        self._onnx_position_ids_base = np.arange(cp_len, dtype=np.int64)
+        self._onnx_position_ids_buffer = np.zeros((cp_len,), dtype=np.int64)
         self._onnx_init_past_from_template = bool(meta.get("onnx_init_past_from_template", True))
         self._onnx_num_pad = int(meta["num_pad_tensors"])
         self._onnx_pad_input_keys = [f"pad_cache_{i}" for i in range(self._onnx_num_pad)]
-        n_states_total = len(self._onnx_input_names) - 1 - (1 if self._onnx_has_cache_position_input else 0)
+        n_non_state_inputs = 1
+        if self._onnx_has_cache_position_input:
+            n_non_state_inputs += 1
+        if self._onnx_has_position_ids_input:
+            n_non_state_inputs += 1
+        n_states_total = len(self._onnx_input_names) - n_non_state_inputs
         n_past = max(0, n_states_total - self._onnx_num_pad)
         self._onnx_past_input_keys = [f"past_{i}" for i in range(n_past)]
         spec = self.get_mimi_streaming_onnx_io_spec(batch_size=1)
@@ -1015,9 +1187,7 @@ class EncoderMimiOnnx(EncoderMimi):
                 pad.append(_zero_from_onnx_input(self._onnx_pad_input_keys[i]))
 
         # Past KV cache: always derive from ONNX session input metadata.
-        # These start empty (seq_len=0) and the probe result structure can
-        # vary across transformers versions (DynamicCache, SlidingWindowCache,
-        # etc.), so we avoid relying on it here.
+        # These start empty (seq_len=0); shapes follow the export contract, not a live probe.
         self._onnx_past_init_time_dims: dict[str, int | None] = {}
         contract = meta.get("contract", {})
         past_template_shapes = contract.get("past_template_shapes", []) if isinstance(contract, dict) else []
@@ -1044,13 +1214,17 @@ class EncoderMimiOnnx(EncoderMimi):
 
         input_template = {"wave_24k": wave}
         if self._onnx_has_cache_position_input:
+            np.add(self._onnx_cache_position_base, int(self._onnx_cache_position_start), out=self._onnx_cache_position_buffer, casting="unsafe")
+            np.mod(self._onnx_cache_position_buffer, int(self._onnx_max_past_len), out=self._onnx_cache_position_buffer)
+            input_template[self._onnx_cache_position_key] = self._onnx_cache_position_buffer
+        if self._onnx_has_position_ids_input:
             np.add(
-                self._onnx_cache_position_base,
-                int(self._onnx_cache_position_start),
-                out=self._onnx_cache_position_buffer,
+                self._onnx_position_ids_base,
+                int(self._onnx_position_ids_start),
+                out=self._onnx_position_ids_buffer,
                 casting="unsafe",
             )
-            input_template[self._onnx_cache_position_key] = self._onnx_cache_position_buffer
+            input_template[self._onnx_position_ids_key] = self._onnx_position_ids_buffer
         for i, s in enumerate(self._onnx_states):
             if i < self._onnx_num_pad:
                 input_template[self._onnx_pad_input_keys[i]] = s
@@ -1078,6 +1252,8 @@ class EncoderMimiOnnx(EncoderMimi):
             cp_len = max(1, int(self._onnx_cache_position_len))
             self._onnx_cuda_cp_base_t = torch.arange(cp_len, dtype=torch.int64, device="cuda")
             self._onnx_cuda_cp_buffer_t = torch.zeros((cp_len,), dtype=torch.int64, device="cuda")
+            self._onnx_cuda_pos_base_t = torch.arange(cp_len, dtype=torch.int64, device="cuda")
+            self._onnx_cuda_pos_buffer_t = torch.zeros((cp_len,), dtype=torch.int64, device="cuda")
             self._onnx_cuda_wave_buffer_t = torch.empty(
                 self._onnx_wave_shape,
                 dtype=torch.float32,
@@ -1113,15 +1289,20 @@ class EncoderMimiOnnx(EncoderMimi):
             self._onnx_cuda_embeddings_ortvalue = None
 
     def _advance_cache_position(self, cp_out) -> None:
+        step = int(self._onnx_cache_position_len)
         if cp_out is None:
             if self._onnx_has_cache_position_input:
-                self._onnx_cache_position_start = np.int64(
-                    int(self._onnx_cache_position_start) + int(self._onnx_cache_position_len)
-                )
+                next_local = int(self._onnx_cache_position_start) + step
+                self._onnx_cache_position_start = np.int64(next_local % int(self._onnx_max_past_len))
+            if self._onnx_has_position_ids_input:
+                self._onnx_position_ids_start = np.int64(int(self._onnx_position_ids_start) + step)
             return
         cp_arr = np.asarray(cp_out, dtype=np.int64).reshape(-1)
         if cp_arr.size > 0:
-            self._onnx_cache_position_start = np.int64(cp_arr[-1])
+            if self._onnx_has_cache_position_input:
+                self._onnx_cache_position_start = np.int64(int(cp_arr[-1]) % int(self._onnx_max_past_len))
+            if self._onnx_has_position_ids_input:
+                self._onnx_position_ids_start = np.int64(int(self._onnx_position_ids_start) + step)
 
     def reset_streaming_state(self):
         super().reset_streaming_state()
@@ -1172,6 +1353,11 @@ class EncoderMimiOnnx(EncoderMimi):
                     int(self._onnx_cache_position_start),
                     out=self._onnx_cuda_cp_buffer_t,
                 )
+                torch.remainder(
+                    self._onnx_cuda_cp_buffer_t,
+                    int(self._onnx_max_past_len),
+                    out=self._onnx_cuda_cp_buffer_t,
+                )
                 io.bind_input(
                     self._onnx_cache_position_key,
                     "cuda",
@@ -1179,6 +1365,20 @@ class EncoderMimiOnnx(EncoderMimi):
                     np.int64,
                     tuple(self._onnx_cuda_cp_buffer_t.shape),
                     int(self._onnx_cuda_cp_buffer_t.data_ptr()),
+                )
+            if self._onnx_has_position_ids_input:
+                torch.add(
+                    self._onnx_cuda_pos_base_t,
+                    int(self._onnx_position_ids_start),
+                    out=self._onnx_cuda_pos_buffer_t,
+                )
+                io.bind_input(
+                    self._onnx_position_ids_key,
+                    "cuda",
+                    0,
+                    np.int64,
+                    tuple(self._onnx_cuda_pos_buffer_t.shape),
+                    int(self._onnx_cuda_pos_buffer_t.data_ptr()),
                 )
             use_slot0_as_in = not self._onnx_cuda_kv_ping
             pads_in = self._onnx_cuda_pad_slot0 if use_slot0_as_in else self._onnx_cuda_pad_slot1
@@ -1247,7 +1447,16 @@ class EncoderMimiOnnx(EncoderMimi):
                 out=self._onnx_cache_position_buffer,
                 casting="unsafe",
             )
+            np.mod(self._onnx_cache_position_buffer, int(self._onnx_max_past_len), out=self._onnx_cache_position_buffer)
             self._onnx_inputs[self._onnx_cache_position_key] = self._onnx_cache_position_buffer
+        if self._onnx_has_position_ids_input:
+            np.add(
+                self._onnx_position_ids_base,
+                int(self._onnx_position_ids_start),
+                out=self._onnx_position_ids_buffer,
+                casting="unsafe",
+            )
+            self._onnx_inputs[self._onnx_position_ids_key] = self._onnx_position_ids_buffer
         ort_inputs = self._onnx_inputs
         for i in range(self._onnx_num_pad):
             ort_inputs[self._onnx_pad_input_keys[i]] = self._onnx_states[i]
@@ -1292,14 +1501,14 @@ def build_audio_encoder(conf, cpc_model: str = ""):
             getattr(
                 conf,
                 "mimi_onnx_fp32_path",
-                "onnx/mimi_streaming_fp32_v3_sliding.onnx",
+                "onnx/mimi_streaming_fp32_v5_static.onnx",
             )
         )
         int8_path = str(
             getattr(
                 conf,
                 "mimi_onnx_int8_path",
-                "onnx/mimi_streaming_int8_matmul_v3_sliding.onnx",
+                "onnx/mimi_streaming_int8_matmul_v5_static.onnx",
             )
         )
         if not use_onnx:
