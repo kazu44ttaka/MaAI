@@ -11,6 +11,7 @@ from typing import Any, Optional
 from pathlib import Path
 
 from .encoder_components import CConv1d, load_CPC, get_cnn_layer
+from .util import download_continuous_mimi_onnx
 
 import time
 import copy
@@ -1497,20 +1498,6 @@ def build_audio_encoder(conf, cpc_model: str = ""):
         if runtime_device.startswith("cuda") and onnx_precision == "int8":
             raise ValueError("mimi_onnx_precision='int8' is not supported with CUDA. Use 'fp32' on CUDA.")
 
-        fp32_path = str(
-            getattr(
-                conf,
-                "mimi_onnx_fp32_path",
-                "onnx/mimi_streaming_fp32_v5_static.onnx",
-            )
-        )
-        int8_path = str(
-            getattr(
-                conf,
-                "mimi_onnx_int8_path",
-                "onnx/mimi_streaming_int8_matmul_v5_static.onnx",
-            )
-        )
         if not use_onnx:
             return EncoderMimi(
                 frame_hz=getattr(conf, "frame_hz", 10),
@@ -1518,33 +1505,45 @@ def build_audio_encoder(conf, cpc_model: str = ""):
                 mimi_model_name=getattr(conf, "mimi_model_name", "kyutai/mimi"),
             )
 
-        fp32_meta = str(
-            getattr(
-                conf,
-                "mimi_onnx_fp32_meta_path",
-                f"{fp32_path}.json",
-            )
-        )
-        int8_meta = str(
-            getattr(
-                conf,
-                "mimi_onnx_int8_meta_path",
-                f"{int8_path}.json",
-            )
-        )
+        def _opt_str(name: str) -> str | None:
+            if not hasattr(conf, name):
+                return None
+            v = getattr(conf, name)
+            if v is None:
+                return None
+            s = str(v).strip()
+            return s if s else None
+
+        fp32_path = _opt_str("mimi_onnx_fp32_path")
+        fp32_meta = _opt_str("mimi_onnx_fp32_meta_path")
+        int8_path = _opt_str("mimi_onnx_int8_path")
+        int8_meta = _opt_str("mimi_onnx_int8_meta_path")
+
         if onnx_precision == "int8":
-            selected = int8_path
-            selected_meta = int8_meta
+            local_onnx, local_meta = int8_path, int8_meta
+            local_label = "mimi_onnx_int8_path"
         else:
-            selected = fp32_path
-            selected_meta = fp32_meta
+            local_onnx, local_meta = fp32_path, fp32_meta
+            local_label = "mimi_onnx_fp32_path"
 
-        if not os.path.exists(selected):
-            raise FileNotFoundError(f"Mimi ONNX model not found: {selected}")
-        if not os.path.exists(selected_meta):
-            raise FileNotFoundError(f"Mimi ONNX meta not found: {selected_meta}")
+        hf_cache_dir = getattr(conf, "mimi_onnx_hf_cache_dir", None)
+        hf_force = bool(getattr(conf, "mimi_onnx_hf_force_download", False))
 
-        print(f"Using ONNX Mimi backend ({onnx_precision}): {selected}")
+        if local_onnx:
+            selected_meta = local_meta or f"{local_onnx}.json"
+            if not os.path.isfile(local_onnx) or not os.path.isfile(selected_meta):
+                raise FileNotFoundError(
+                    f"Local Mimi ONNX paths were set ({local_label}) but files are missing: "
+                    f"onnx={local_onnx!r} meta={selected_meta!r}"
+                )
+            selected = local_onnx
+            print(f"Using ONNX Mimi backend ({onnx_precision}, local): {selected}")
+        else:
+            selected, selected_meta = download_continuous_mimi_onnx(
+                precision=onnx_precision,
+                cache_dir=hf_cache_dir,
+                force_download=hf_force,
+            )
         return EncoderMimiOnnx(
             frame_hz=getattr(conf, "frame_hz", 12.5),
             freeze=conf.freeze_encoder,

@@ -38,6 +38,9 @@ repo_ids = {
     # "vap_nod_jp_only_timing": "maai-kyoto/vap_nod_jp_only_timing",
 }
 
+# Streaming Mimi ONNX weights (same hub pattern as VAP checkpoints).
+CONTINUOUS_MIMI_ONNX_REPO_ID = "maai-kyoto/continuous-mimi-onnx"
+
 def _format_frame_rate(frame_rate: float) -> str:
     frame_rate = float(frame_rate)
     if frame_rate.is_integer():
@@ -547,3 +550,38 @@ def conv_bytearray_2_vapresult_nod(barr):
     }
     
     return result_vap
+
+def download_continuous_mimi_onnx(
+    precision: str = "fp32",
+    cache_dir: str | None = None,
+    force_download: bool = False,
+) -> tuple[str, str]:
+    """
+    Resolve paths to the streaming Mimi ONNX model and JSON sidecar on disk.
+
+    Files are fetched from ``maai-kyoto/continuous-mimi-onnx`` via ``hf_hub_download``
+    (cached under the usual Hugging Face cache layout, or under ``cache_dir`` when set).
+    """
+    precision = str(precision).strip().lower()
+    if precision == "fp32":
+        onnx_fn = "continuous_mimi_fp32.onnx"
+        meta_fn = "continuous_mimi_fp32.json"
+    elif precision == "int8":
+        onnx_fn = "continuous_mimi_int8.onnx"
+        meta_fn = "continuous_mimi_int8.json"
+    else:
+        raise ValueError(f"Unsupported precision for continuous Mimi ONNX: {precision}")
+
+    onnx_path = hf_hub_download(
+        repo_id=CONTINUOUS_MIMI_ONNX_REPO_ID,
+        filename=onnx_fn,
+        cache_dir=cache_dir,
+        force_download=force_download,
+    )
+    meta_path = hf_hub_download(
+        repo_id=CONTINUOUS_MIMI_ONNX_REPO_ID,
+        filename=meta_fn,
+        cache_dir=cache_dir,
+        force_download=force_download,
+    )
+    return str(onnx_path), str(meta_path)

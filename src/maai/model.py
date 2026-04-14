@@ -42,6 +42,10 @@ class Maai():
         mimi_onnx_fp32_meta_path: str | None = None,
         mimi_onnx_int8_path: str | None = None,
         mimi_onnx_int8_meta_path: str | None = None,
+        mimi_local_onnx_fp32_path: str | None = None,
+        mimi_local_onnx_fp32_meta_path: str | None = None,
+        mimi_local_onnx_int8_path: str | None = None,
+        mimi_local_onnx_int8_meta_path: str | None = None,
         mimi_onnx_cpu_intra_threads: int | None = None,
         mimi_onnx_cpu_inter_threads: int | None = None,
         cache_dir: str = None,
@@ -67,14 +71,21 @@ class Maai():
             conf.mimi_onnx_cpu_intra_threads = int(mimi_onnx_cpu_intra_threads)
         if mimi_onnx_cpu_inter_threads is not None:
             conf.mimi_onnx_cpu_inter_threads = int(mimi_onnx_cpu_inter_threads)
-        if mimi_onnx_fp32_path is not None:
-            conf.mimi_onnx_fp32_path = str(mimi_onnx_fp32_path)
-        if mimi_onnx_fp32_meta_path is not None:
-            conf.mimi_onnx_fp32_meta_path = str(mimi_onnx_fp32_meta_path)
-        if mimi_onnx_int8_path is not None:
-            conf.mimi_onnx_int8_path = str(mimi_onnx_int8_path)
-        if mimi_onnx_int8_meta_path is not None:
-            conf.mimi_onnx_int8_meta_path = str(mimi_onnx_int8_meta_path)
+        fp32_onnx = mimi_local_onnx_fp32_path or mimi_onnx_fp32_path
+        fp32_meta = mimi_local_onnx_fp32_meta_path or mimi_onnx_fp32_meta_path
+        int8_onnx = mimi_local_onnx_int8_path or mimi_onnx_int8_path
+        int8_meta = mimi_local_onnx_int8_meta_path or mimi_onnx_int8_meta_path
+        if fp32_onnx is not None:
+            conf.mimi_onnx_fp32_path = str(fp32_onnx)
+        if fp32_meta is not None:
+            conf.mimi_onnx_fp32_meta_path = str(fp32_meta)
+        if int8_onnx is not None:
+            conf.mimi_onnx_int8_path = str(int8_onnx)
+        if int8_meta is not None:
+            conf.mimi_onnx_int8_meta_path = str(int8_meta)
+        if cache_dir is not None:
+            conf.mimi_onnx_hf_cache_dir = cache_dir
+        conf.mimi_onnx_hf_force_download = bool(force_download)
 
         # # Middle size model
         # if "middle" in lang:
