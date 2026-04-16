@@ -34,6 +34,7 @@ repo_ids = {
     "vap_bc_2type_jp": "maai-kyoto/vap_bc_2type_jp",
     # "vap_bc_jp_only_timing": "maai-kyoto/vap_bc_jp_only_timing",
     "vap_nod_jp": "maai-kyoto/vap_nod_jp",
+    "vap_nod_para_jp": "maai-kyoto/vap_nod_para_jp",
     "vap_prompt_jp": "maai-kyoto/vap_prompt_jp",
     # "vap_nod_jp_only_timing": "maai-kyoto/vap_nod_jp_only_timing",
 }
@@ -203,8 +204,20 @@ def load_vap_model(mode: str, frame_rate: float, context_len_sec: float, languag
         else:
             supported_languages = ["jp"]
             raise ValueError(f"Invalid language: {language}. Mode {mode} supports languages are: {supported_languages}")
+
+    elif mode == "nod_para":
+        if language != "jp":
+            supported_languages = ["jp"]
+            raise ValueError(
+                f"Invalid language: {language}. Mode {mode} supports languages are: {supported_languages}"
+            )
+        repo_id = repo_ids["vap_nod_para_jp"]
+        file_path = (
+            f"vap-nod_para_state_dict_erica_{frame_rate_label}hz_{int(context_len_sec*1000)}msec.pt"
+        )
+
     else:
-        supported_modes = ["vap", "vap_mc", "bc_2type", "nod"]
+        supported_modes = ["vap", "vap_mc", "bc", "bc_2type", "nod", "vap_prompt", "nod_para"]
         raise ValueError(f"Invalid mode: {mode}. Supported modes are: {supported_modes}")
 
     try:

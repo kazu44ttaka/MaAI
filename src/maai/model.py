@@ -13,6 +13,7 @@ from .models.vap import VapGPT
 from .models.vap_bc import VapGPT_bc
 from .models.vap_bc_2type import VapGPT_bc_2type
 from .models.vap_nod import VapGPT_nod
+from .models.vap_nod_para import VapGPT_nod_para
 from .models.config import VapConfig
 # from .models.vap_prompt import VapGPT_prompt
 
@@ -105,6 +106,10 @@ class Maai():
         
         elif mode == "nod":
             self.vap = VapGPT_nod(conf)
+
+        elif mode == "nod_para":
+            conf.dropout = 0.2
+            self.vap = VapGPT_nod_para(conf)
         
         elif mode == "vap_prompt":
             from .models.vap_prompt import VapGPT_prompt
@@ -121,6 +126,8 @@ class Maai():
         # Store the initial state of the model to check for unchanged parameters
         initial_state_dict = {name: param.clone() for name, param in self.vap.named_parameters()}
 
+        nod_param_stats_from_file = None
+        nod_count_thresholds_from_file = None
         if local_model is None:
             sd = load_vap_model(
                 mode,
@@ -132,14 +139,50 @@ class Maai():
                 force_download,
                 model_type=model_type,
             )
+            if (
+                mode == "nod_para"
+                and isinstance(sd, dict)
+                and "state_dict" in sd
+            ):
+                nod_param_stats_from_file = sd.get("nod_param_stats")
+                nod_count_thresholds_from_file = sd.get("nod_count_thresholds")
+                sd = sd["state_dict"]
         else:
             print("Loading model from local file:", local_model)
-            sd = torch.load(local_model, map_location="cpu")
-        
+            raw = torch.load(local_model, map_location="cpu")
+            if isinstance(raw, dict):
+                nod_param_stats_from_file = raw.get("nod_param_stats")
+                nod_count_thresholds_from_file = raw.get("nod_count_thresholds")
+                if "state_dict" in raw:
+                    sd = raw["state_dict"]
+                else:
+                    sd = raw
+            else:
+                sd = raw
+
         if hasattr(self.vap, "conf"):
             setattr(self.vap.conf, "runtime_device", self.device)
         self.vap.load_encoder(cpc_model=cpc_model)
         self.vap.load_state_dict(sd, strict=False)
+
+        if (
+            mode == "nod_para"
+            and nod_param_stats_from_file is not None
+            and isinstance(nod_param_stats_from_file, dict)
+        ):
+            for _k in ("range_mean", "range_std", "speed_mean", "speed_std"):
+                if _k in nod_param_stats_from_file:
+                    self.vap.nod_param_stats[_k] = float(nod_param_stats_from_file[_k])
+        if (
+            mode == "nod_para"
+            and nod_count_thresholds_from_file is not None
+            and isinstance(nod_count_thresholds_from_file, dict)
+        ):
+            for _k in ("t0", "t1", "t2"):
+                if _k in nod_count_thresholds_from_file:
+                    self.vap.nod_count_thresholds[_k] = float(nod_count_thresholds_from_file[_k])
+            if "t_swing" in nod_count_thresholds_from_file:
+                self.vap.nod_swing_up_threshold = float(nod_count_thresholds_from_file["t_swing"])
 
         if conf.encoder_type == "cpc" and 'encoder.downsample.1.weight' in sd:
             self.vap.encoder1.downsample[1].weight = nn.Parameter(sd['encoder.downsample.1.weight'])
@@ -491,7 +534,16 @@ class Maai():
                     "p_nod_short": out['p_nod_short'],
                     "p_nod_long": out['p_nod_long'],
                     "p_nod_long_p": out['p_nod_long_p']
-                }
+                },
+                "nod_para": lambda: {
+                    "p_nod": out["p_nod"],
+                    "nod_count": out["nod_count"],
+                    "nod_count_pred": out["nod_count_pred"],
+                    "nod_range": out["nod_range"],
+                    "nod_speed": out["nod_speed"],
+                    "nod_swing_up": out["nod_swing_up"],
+                    "nod_swing_up_pred": out["nod_swing_up_pred"],
+                },
             }
             
             # Get mode-specific outputs
