@@ -12,8 +12,8 @@ from ..modules import GPT, GPTStereo
 from ..objective import ObjectiveVAP
 
 # 推論固定トポロジ（grid_config_12.5hz_taskGPT_mimi_realtime 相当）
-_NOD_PARA_ACTIVE_PARAM_TASKS = frozenset({"count", "range", "speed", "swing_binary"})
-_NOD_COUNT_BINARY = 0  # 0=3クラス頷き回数, 1=2値
+_NOD_PARA_ACTIVE_PARAM_TASKS = frozenset({"repetitions", "range", "speed", "swing_binary"})
+_NOD_REPETITIONS_BINARY = 0  # 0=3-class repetitions, 1=binary
 _GPT_OUTPUT_DROPOUT = 0.2
 _TASK_GPT_OUTPUT_DROPOUT = 0.0
 _NOD_HEAD_DROPOUT = 0.3
@@ -61,7 +61,7 @@ class VapGPT_nod_para(nn.Module):
             "speed_std": 1.0,
         }
         # 閾値探索で得た推論時しきい値（.pt に含まれる場合は外部から上書き）
-        self.nod_count_thresholds: Dict[str, float] = {"t0": 1.0, "t1": 1.0, "t2": 1.0}
+        self.nod_repetitions_thresholds: Dict[str, float] = {"t0": 1.0, "t1": 1.0, "t2": 1.0}
         self.nod_swing_up_threshold: float = 0.5
 
         self.objective = ObjectiveVAP(bin_times=conf.bin_times, frame_hz=conf.frame_hz)
@@ -111,7 +111,7 @@ class VapGPT_nod_para(nn.Module):
             }
         )
         self.task_gpt_group_map = {
-            "count": "0",
+            "repetitions": "0",
             "range": "0",
             "speed": "0",
             "swing_binary": "0",
@@ -139,11 +139,11 @@ class VapGPT_nod_para(nn.Module):
                 return _build_mlp(in_d, mlp_h, out_d, mlp_n, head_do)
             return nn.Linear(in_d, out_d)
 
-        nod_count_out = 1 if _NOD_COUNT_BINARY == 1 else 3
+        nod_repetitions_out = 1 if _NOD_REPETITIONS_BINARY == 1 else 3
         in_d = base_head_input_dim
-        self.nod_count_head = (
-            _para_head(conf.nod_head_mlp_count, in_d, nod_count_out)
-            if "count" in active
+        self.nod_repetitions_head = (
+            _para_head(conf.nod_head_mlp_repetitions, in_d, nod_repetitions_out)
+            if "repetitions" in active
             else None
         )
         self.nod_range_head = (
@@ -193,7 +193,7 @@ class VapGPT_nod_para(nn.Module):
         return value * std + mean
 
     @staticmethod
-    def _apply_count_thresholds(prob: List[float], thresholds: Dict[str, float]) -> int:
+    def _apply_repetitions_thresholds(prob: List[float], thresholds: Dict[str, float]) -> int:
         t = torch.tensor(
             [
                 float(thresholds.get("t0", 1.0)),
@@ -277,7 +277,7 @@ class VapGPT_nod_para(nn.Module):
         def _sel(task: str) -> Tensor:
             return nod_param_bases[task]
 
-        nod_count_out_dim = 1 if _NOD_COUNT_BINARY == 1 else 3
+        nod_repetitions_out_dim = 1 if _NOD_REPETITIONS_BINARY == 1 else 3
 
         def _head_or_zeros(module: Optional[nn.Module], task: str, out_dim: int) -> Tensor:
             xb = _sel(task)
@@ -285,7 +285,9 @@ class VapGPT_nod_para(nn.Module):
                 return xb.new_zeros(*xb.shape[:-1], out_dim)
             return module(xb)
 
-        nod_count = _head_or_zeros(self.nod_count_head, "count", nod_count_out_dim)
+        nod_rep_logits = _head_or_zeros(
+            self.nod_repetitions_head, "repetitions", nod_repetitions_out_dim
+        )
         nod_range = _head_or_zeros(self.nod_range_head, "range", 1)
         nod_speed = _head_or_zeros(self.nod_speed_head, "speed", 1)
         nod_swing_bin = _head_or_zeros(
@@ -325,9 +327,11 @@ class VapGPT_nod_para(nn.Module):
         p_bc = float(bc.sigmoid().to("cpu").tolist()[0][-1][0])
         p_nod = float(nod_t.sigmoid().to("cpu").tolist()[0][-1][0])
 
-        nc = nod_count.softmax(dim=-1).to("cpu").tolist()[0][-1]
-        nod_count = [float(nc[i]) for i in range(len(nc))]
-        nod_count_pred = self._apply_count_thresholds(nod_count, self.nod_count_thresholds)
+        nc = nod_rep_logits.softmax(dim=-1).to("cpu").tolist()[0][-1]
+        nod_repetitions = [float(nc[i]) for i in range(len(nc))]
+        nod_repetitions_pred = self._apply_repetitions_thresholds(
+            nod_repetitions, self.nod_repetitions_thresholds
+        )
 
         st = self.nod_param_stats
         nod_range_z = float(nod_range.to("cpu").tolist()[0][-1][0])
@@ -352,8 +356,8 @@ class VapGPT_nod_para(nn.Module):
             "vad": [vad2, vad1],
             "p_bc": p_bc,
             "p_nod": p_nod,
-            "nod_count": nod_count,
-            "nod_count_pred": nod_count_pred,
+            "nod_repetitions": nod_repetitions,
+            "nod_repetitions_pred": nod_repetitions_pred,
             "nod_range": nod_range_val,
             "nod_speed": nod_speed_val,
             "nod_swing_up": nod_swing_up_prob,

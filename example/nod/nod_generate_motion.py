@@ -36,7 +36,7 @@ def main() -> None:
     p.add_argument(
         "--velocity",
         type=float,
-        default=1.5,
+        default=0.75,
         help="Target mean angular velocity (rad/s).",
     )
     p.add_argument("--fps", type=int, default=30, help="Output frame rate.")

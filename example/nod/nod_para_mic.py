@@ -21,7 +21,7 @@ def test():
     # Use zero signals for the second channel
     zero = MaaiInput.Zero()
 
-    output = MaaiOutput.GuiPlot()
+    output = MaaiOutput.ConsoleBar()
 
     maai = Maai(
         mode="nod_para",

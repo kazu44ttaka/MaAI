@@ -40,7 +40,7 @@ class VapConfig:
     dim_prompt_2: int = 256
 
     # --- Nod para（mode=nod_para / MLP 層数・隠れ次元・TaskGPT 層数のみ可変、他は vap_nod_para 内固定）---
-    nod_head_mlp_count: int = 1
+    nod_head_mlp_repetitions: int = 1
     nod_head_mlp_range: int = 1
     nod_head_mlp_speed: int = 1
     nod_head_mlp_swing_binary: int = 1

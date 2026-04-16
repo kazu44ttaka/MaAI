@@ -46,6 +46,22 @@ def _draw_balance_bar(value: float, length: int = 30) -> str:
         return ' ' * max_len + '│' + '█' * right + ' ' * (max_len - right)
 
 
+def _draw_rep_pred_incremental_bar(selected: int, num_classes: int, length: int = 30) -> str:
+    """クラス 0..n-1 に対し、左から 1 区画ずつ増えるバー（0→1区画、1→2区画、2→3区画）。"""
+    n = max(1, int(num_classes))
+    sel = int(max(0, min(n - 1, selected)))
+    n_fill = sel + 1  # 左から何区画を █ にするか（1..n）
+    base, extra = divmod(length, n)
+    parts: list[str] = []
+    for i in range(n):
+        seg = base + (1 if i < extra else 0)
+        if i < n_fill:
+            parts.append("█" * seg)
+        else:
+            parts.append("-" * seg)
+    return "".join(parts)
+
+
 def _rms(values: Union[List[float], tuple]) -> float:
     """RMS値を計算"""
     if not values:
@@ -61,8 +77,8 @@ def _normalize_linear(value: float, vmin: float, vmax: float) -> float:
     return (v - vmin) / (vmax - vmin)
 
 
-def _is_nod_para_style_count(result: Dict[str, Any]) -> bool:
-    nc = result.get("nod_count")
+def _is_nod_para_style_repetitions(result: Dict[str, Any]) -> bool:
+    nc = result.get("nod_repetitions")
     return isinstance(nc, (list, tuple)) and len(nc) == 3
 
 
@@ -109,7 +125,7 @@ class ConsoleBar:
             print(f"Time: {dt.tm_year:04d}/{dt.tm_mon:02d}/{dt.tm_mday:02d} {dt.tm_hour:02d}:{dt.tm_min:02d}:{dt.tm_sec:02d}.{ms:03d}")
             print("-" * (self.bar_length + 30))
         
-        is_nod_para = _is_nod_para_style_count(result)
+        is_nod_para = _is_nod_para_style_repetitions(result)
 
         # bar_typeがbalanceのとき、x1/x2を横並び表示（nod_para は後段で順序付き表示）
         if (
@@ -140,12 +156,12 @@ class ConsoleBar:
                 "p_nod",
                 "nod_range",
                 "nod_speed",
-                "nod_count",
-                "nod_count_pred",
+                "nod_repetitions",
+                "nod_repetitions_pred",
                 "nod_swing_up",
                 "nod_swing_up_pred",
             }
-            # 順: x1, x2 → p_nod → range → speed → count（3本）→ swing（確率のみ）
+            # 順: x1, x2 → p_nod → range → speed → repetitions（3本）→ swing（確率のみ）
             if self.bar_type == "balance" and "x1" in result and "x2" in result:
                 x1 = np.squeeze(np.array(result["x1"])).tolist()
                 x2 = np.squeeze(np.array(result["x2"])).tolist()
@@ -191,18 +207,30 @@ class ConsoleBar:
                 bar = _draw_bar(nv, self.bar_length)
                 print(f"{'nod_speed':15}: {bar} ({sv:.4f})")
 
-            nc = result["nod_count"]
+            nc = result["nod_repetitions"]
             labels = ("1", "2", "3+")
             for i, lab in enumerate(labels):
                 v = float(nc[i])
                 bar = _draw_bar(v, self.bar_length)
-                key = f"nod_count {lab}"
-                print(f"{key:15}: {bar} ({v:.3f})")
+                label = f"nod_rep {lab}"
+                print(f"{label:15}: {bar} ({v:.3f})")
+
+            if "nod_repetitions_pred" in result:
+                rp = int(result["nod_repetitions_pred"])
+                bar = _draw_rep_pred_incremental_bar(rp, 3, self.bar_length)
+                cls_labels = ("1", "2", "3+")
+                lab = cls_labels[rp] if 0 <= rp < len(cls_labels) else "?"
+                print(f"{'nod_rep_pred':15}: {bar} (class {lab})")
 
             if "nod_swing_up" in result:
                 v = float(result["nod_swing_up"])
                 bar = _draw_bar(v, self.bar_length)
                 print(f"{'nod_swing_up':15}: {bar} ({v:.3f})")
+
+            if "nod_swing_up_pred" in result:
+                sp = int(max(0, min(1, int(result["nod_swing_up_pred"]))))
+                bar = _draw_bar(float(sp), self.bar_length)
+                print(f"{'swing_pred':15}: {bar} ({sp} = off/on)")
     
         # 各キーを動的に処理
         for key, value in result.items():
@@ -487,7 +515,7 @@ class GuiPlot:
 
     @staticmethod
     def _nod_scalar(key: str, val: Any) -> float:
-        if key == "nod_count":
+        if key == "nod_repetitions":
             if isinstance(val, (list, tuple, np.ndarray)):
                 a = np.asarray(val, dtype=float).reshape(-1)
                 return float(int(np.argmax(a))) if a.size else 0.0
@@ -523,7 +551,7 @@ class GuiPlot:
             "vad",
             "silero_vad_score",
         ]
-        _skip_plot_keys = frozenset({"nod_count_pred", "nod_swing_up_pred"})
+        _skip_plot_keys = frozenset({"nod_repetitions_pred", "nod_swing_up_pred"})
         self.keys = [k for k in special_keys if k in result] + [
             k
             for k in result.keys()
@@ -641,8 +669,8 @@ class GuiPlot:
                 c = p.plot(self._x_ctx, buf, pen=pg.mkPen((100, 200, 220), width=1.6))
                 self.curves[key] = c
                 self.data_buffer[key] = list(buf)
-            elif key == "nod_count":
-                self._cfg(p, "nod_count (1 / 2 / 3+)")
+            elif key == "nod_repetitions":
+                self._cfg(p, "nod_repetitions (1 / 2 / 3+)")
                 p.setYRange(-0.15, 2.15, padding=0.0)
                 buf = np.zeros(self.MAX_CONTEXT_LEN, dtype=float)
                 c = p.plot(self._x_ctx, buf, pen=pg.mkPen((255, 170, 50), width=2.0))
@@ -780,7 +808,7 @@ class GuiPlot:
                 if draw:
                     x = np.linspace(-self.shown_context_sec, 0.0, len(buf))
                     self.curves[key].setData(x, np.clip(np.asarray(buf, dtype=float), 0.0, 1.0))
-            elif key in ("nod_range", "nod_speed", "nod_count", "nod_swing_up") and key in self.curves:
+            elif key in ("nod_range", "nod_speed", "nod_repetitions", "nod_swing_up") and key in self.curves:
                 buf = self.data_buffer[key]
                 ns = self._nod_scalar(key, val)
                 buf = buf + [ns]

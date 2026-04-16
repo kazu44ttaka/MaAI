@@ -145,14 +145,18 @@ class Maai():
                 and "state_dict" in sd
             ):
                 nod_param_stats_from_file = sd.get("nod_param_stats")
-                nod_count_thresholds_from_file = sd.get("nod_count_thresholds")
+                nod_count_thresholds_from_file = sd.get("nod_count_thresholds") or sd.get(
+                    "nod_repetitions_thresholds"
+                )
                 sd = sd["state_dict"]
         else:
             print("Loading model from local file:", local_model)
             raw = torch.load(local_model, map_location="cpu")
             if isinstance(raw, dict):
                 nod_param_stats_from_file = raw.get("nod_param_stats")
-                nod_count_thresholds_from_file = raw.get("nod_count_thresholds")
+                nod_count_thresholds_from_file = raw.get(
+                    "nod_count_thresholds"
+                ) or raw.get("nod_repetitions_thresholds")
                 if "state_dict" in raw:
                     sd = raw["state_dict"]
                 else:
@@ -163,6 +167,16 @@ class Maai():
         if hasattr(self.vap, "conf"):
             setattr(self.vap.conf, "runtime_device", self.device)
         self.vap.load_encoder(cpc_model=cpc_model)
+        if mode == "nod_para" and isinstance(sd, dict):
+            remapped_sd: dict = {}
+            for _k, _v in sd.items():
+                if _k.startswith("nod_count_head."):
+                    remapped_sd[
+                        "nod_repetitions_head." + _k[len("nod_count_head.") :]
+                    ] = _v
+                else:
+                    remapped_sd[_k] = _v
+            sd = remapped_sd
         self.vap.load_state_dict(sd, strict=False)
 
         if (
@@ -180,7 +194,9 @@ class Maai():
         ):
             for _k in ("t0", "t1", "t2"):
                 if _k in nod_count_thresholds_from_file:
-                    self.vap.nod_count_thresholds[_k] = float(nod_count_thresholds_from_file[_k])
+                    self.vap.nod_repetitions_thresholds[_k] = float(
+                        nod_count_thresholds_from_file[_k]
+                    )
             if "t_swing" in nod_count_thresholds_from_file:
                 self.vap.nod_swing_up_threshold = float(nod_count_thresholds_from_file["t_swing"])
 
@@ -537,8 +553,8 @@ class Maai():
                 },
                 "nod_para": lambda: {
                     "p_nod": out["p_nod"],
-                    "nod_count": out["nod_count"],
-                    "nod_count_pred": out["nod_count_pred"],
+                    "nod_repetitions": out["nod_repetitions"],
+                    "nod_repetitions_pred": out["nod_repetitions_pred"],
                     "nod_range": out["nod_range"],
                     "nod_speed": out["nod_speed"],
                     "nod_swing_up": out["nod_swing_up"],
