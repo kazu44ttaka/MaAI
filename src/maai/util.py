@@ -1,3 +1,6 @@
+import math
+
+import numpy as np
 import torch
 from huggingface_hub import hf_hub_download, list_repo_files
 
@@ -598,3 +601,139 @@ def download_continuous_mimi_onnx(
         force_download=force_download,
     )
     return str(onnx_path), str(meta_path)
+
+def generate_natural_nod(
+    range_rad: float,
+    count: int,
+    use_pre_rise: bool,
+    velocity: float,
+    fps: int = 30,
+    decay_rate: float = 0.6,
+    pre_rise_ratio: float = 0.8,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Generate a natural nodding motion sequence (pitch in radians vs time in seconds).
+
+    Interpolation is cubic spline (``CubicSpline``) when scipy is available,
+    else cosine interpolation between keyframes.
+
+    Parameters
+    ----------
+    range_rad : float
+        Nod depth in radians (absolute value).
+    count : int
+        Number of nods (>= 1).
+    use_pre_rise : bool
+        Whether to include a pre-rise before the first nod.
+    velocity : float
+        Target average angular velocity (rad/s).
+    fps : int
+        Output frame rate.
+    decay_rate : float
+        Amplitude decay per nod (0–1).
+    pre_rise_ratio : float
+        Pre-rise amplitude as a ratio of *range_rad*.
+
+    Returns
+    -------
+    motion : np.ndarray
+        Pitch values in radians, one per frame.
+    time_axis : np.ndarray
+        Time stamps in seconds, same length as *motion*.
+    """
+    count = max(1, int(count))
+    fps = max(1, int(fps))
+
+    keyframe_vals: list[float] = [0.0]
+    current_amp = abs(float(range_rad))
+
+    if use_pre_rise:
+        keyframe_vals.extend(
+            [
+                current_amp * float(pre_rise_ratio),
+                -current_amp,
+                0.0,
+            ]
+        )
+    else:
+        keyframe_vals.extend([-current_amp, 0.0])
+
+    for _ in range(count - 1):
+        current_amp *= float(decay_rate)
+        keyframe_vals.extend([-current_amp, 0.0])
+
+    n_seg = len(keyframe_vals) - 1
+    distances: list[float] = []
+    vel_scales: list[float] = []
+    for i in range(n_seg):
+        d = abs(keyframe_vals[i + 1] - keyframe_vals[i])
+        distances.append(d)
+        if d < 1e-6:
+            vel_scales.append(1.0)
+        else:
+            if use_pre_rise:
+                nod_idx = 0 if i < 3 else 1 + (i - 3) // 2
+            else:
+                nod_idx = i // 2
+            vel_scales.append(float(decay_rate) ** (nod_idx * 0.5))
+
+    total_distance = sum(distances)
+    raw_total = sum(d / vs for d, vs in zip(distances, vel_scales))
+    total_time = total_distance / float(velocity) if float(velocity) > 1e-9 else 0.0
+
+    keyframe_frames: list[int] = [0]
+    for d, vs in zip(distances, vel_scales):
+        if raw_total > 1e-9 and d >= 1e-6:
+            duration = (d / vs) * total_time / raw_total
+            n_frames = max(1, int(round(duration * fps)))
+        else:
+            n_frames = 0
+        keyframe_frames.append(keyframe_frames[-1] + n_frames)
+
+    keyframe_times = [f / fps for f in keyframe_frames]
+    total_frames = keyframe_frames[-1]
+
+    if total_frames <= 0:
+        return np.array([0.0]), np.array([0.0])
+
+    time_axis = np.arange(total_frames) / fps
+
+    motion = _nod_motion_cubic_spline_or_cosine(
+        keyframe_times,
+        keyframe_vals,
+        keyframe_frames,
+        time_axis,
+    )
+    return motion, time_axis
+
+def _nod_motion_cubic_spline_or_cosine(
+    keyframe_times: list[float],
+    keyframe_vals: list[float],
+    keyframe_frames: list[int],
+    time_axis: np.ndarray,
+) -> np.ndarray:
+    try:
+        from scipy.interpolate import CubicSpline
+
+        kt = np.asarray(keyframe_times, dtype=float)
+        if kt.size >= 2 and np.all(np.diff(kt) > 1e-15):
+            kv = np.asarray(keyframe_vals, dtype=float)
+            cs = CubicSpline(kt, kv, bc_type=((2, 0), (1, 0)))
+            return np.asarray(cs(time_axis), dtype=float)
+    except ImportError:
+        raise ImportError("scipy is not installed")
+    except Exception as e:
+        raise Exception(f"Error in _nod_motion_cubic_spline_or_cosine: {e}")
+
+def euler_to_quaternion(rx: float, ry: float, rz: float) -> tuple[float, float, float, float]:
+    """XYZ intrinsic Euler angles (radians) to quaternion (qx, qy, qz, qw)."""
+    cx = math.cos(rx / 2.0)
+    sx = math.sin(rx / 2.0)
+    cy = math.cos(ry / 2.0)
+    sy = math.sin(ry / 2.0)
+    cz = math.cos(rz / 2.0)
+    sz = math.sin(rz / 2.0)
+    qx = sx * cy * cz + cx * sy * sz
+    qy = cx * sy * cz - sx * cy * sz
+    qz = cx * cy * sz + sx * sy * cz
+    qw = cx * cy * cz - sx * sy * sz
+    return (qx, qy, qz, qw)
