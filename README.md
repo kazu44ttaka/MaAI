@@ -113,6 +113,7 @@ Backchannels are short listener responses such as `yeah` and `oh`, that are also
 Nodding refers to the up-and-down movement of the head and is closely related to backchanneling. Unlike backchannels that involve vocal responses, nodding allows the listener to express their reaction non-verbally.
 
 - [VAP-based Nodding Prediction Model](readme/vap_nod.md)
+- [VAP-based Nodding Prediction Model with Kinematic Parameter](readme/vap_nod_para.md)
 
 <br>
 
@@ -163,7 +164,10 @@ You can find example implementations of MaAI models in the [example](example) di
     - [With 1 mic input](example/bc_2type/bc_2type_mic.py) 🎤
 
 - Nodding
-    - [With 1 mic input](example/nod/nod_mic.py) 🎤
+    - Prediction of three types of nodding 
+        - [With 1 mic input](example/nod/nod_mic.py) 🎤
+    - Prediction of kinematic parameter of nodding
+        - [With 1 mic input](example/nod/nod_para_mic.py) 🎤
 
 - Output
     - [Console Dynamic Output](example/output/vap_2wav_ConsoleBar.py) 📊
