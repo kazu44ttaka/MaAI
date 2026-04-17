@@ -6,11 +6,12 @@ BIN_TIMES: list = [0.2, 0.4, 0.6, 0.8]
 @dataclass
 class VapConfig:
     sample_rate: int = 16000
-    frame_hz: int = 10
+    frame_hz: float = 10.0
     bin_times: List[float] = field(default_factory=lambda: BIN_TIMES)
 
     # Encoder (training flag)
     encoder_type: str = "cpc"
+    mimi_model_name: str = "kyutai/mimi"
     wav2vec_type: str = "mms"
     hubert_model: str = "hubert_jp"
     freeze_encoder: int = 1  # stupid but works (--vap_freeze_encoder 1)
@@ -37,6 +38,14 @@ class VapConfig:
     # dim_prompt: int = 1792
     dim_prompt: int = 256
     dim_prompt_2: int = 256
+
+    # --- Nod para（mode=nod_para / MLP 層数・隠れ次元・TaskGPT 層数のみ可変、他は vap_nod_para 内固定）---
+    nod_head_mlp_repetitions: int = 1
+    nod_head_mlp_range: int = 1
+    nod_head_mlp_speed: int = 1
+    nod_head_mlp_swing_binary: int = 1
+    nod_head_mlp_hidden: int = 128
+    nod_task_gpt_layers: int = 2
 
     @staticmethod
     def add_argparse_args(parser, fields_added=[]):

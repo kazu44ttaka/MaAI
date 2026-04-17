@@ -1,5 +1,5 @@
 """
-This script is an example of using a single microphone with the VapGPT model.
+This script is an example of using a single microphone with the nodding model.
 """
 
 import sys
@@ -9,7 +9,7 @@ import os
 # This allows you to import modules from the src directory without pip installing the package.
 # Uncomment the line below if you need to run this script directly without installing the package.
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../src/')))
+# sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../src/')))
 
 from maai import Maai, MaaiInput, MaaiOutput
 
@@ -24,13 +24,13 @@ def test():
     output = MaaiOutput.ConsoleBar()
 
     maai = Maai(
-        mode="vap",
+        mode="nod_para",
         lang="jp",
-        frame_rate=10,
+        model_type="normal-ver2",
+        frame_rate=12.5,
         audio_ch1=mic,
         audio_ch2=zero,
-        device="cpu",
-        model_type="normal"
+        device="cpu"
     )
 
     maai.start()
@@ -38,7 +38,7 @@ def test():
     while True:
         result = maai.get_result()
         output.update(result)
-        
+
 if __name__ == "__main__":
     try:
         test()

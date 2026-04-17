@@ -8,11 +8,12 @@ import copy
 import os
 
 from .input import Base
-from .util import load_vap_model
+from .util import load_vap_model, resolve_encoder_type
 from .models.vap import VapGPT
 from .models.vap_bc import VapGPT_bc
 from .models.vap_bc_2type import VapGPT_bc_2type
 from .models.vap_nod import VapGPT_nod
+from .models.vap_nod_para import VapGPT_nod_para
 from .models.config import VapConfig
 # from .models.vap_prompt import VapGPT_prompt
 
@@ -29,18 +30,63 @@ class Maai():
         lang: str,
         audio_ch1: Base,
         audio_ch2: Base,
-        frame_rate: int = 10,
+        frame_rate: float = 10,
         context_len_sec: int = 20,
         device: str = "cpu",
         # num_channels: int = 2,
         cpc_model: str = os.path.expanduser("~/.cache/cpc/60k_epoch4-d0f474de.pt"),
+        model_type: str = "normal",
+        mimi_model_name: str = "kyutai/mimi",
+        use_mimi_onnx: bool = True,
+        mimi_onnx_precision: str = "fp32",
+        mimi_onnx_fp32_path: str | None = None,
+        mimi_onnx_fp32_meta_path: str | None = None,
+        mimi_onnx_int8_path: str | None = None,
+        mimi_onnx_int8_meta_path: str | None = None,
+        mimi_local_onnx_fp32_path: str | None = None,
+        mimi_local_onnx_fp32_meta_path: str | None = None,
+        mimi_local_onnx_int8_path: str | None = None,
+        mimi_local_onnx_int8_meta_path: str | None = None,
+        mimi_onnx_cpu_intra_threads: int | None = None,
+        mimi_onnx_cpu_inter_threads: int | None = None,
         cache_dir: str = None,
         force_download: bool = False,
         use_kv_cache: bool = True,
         local_model = None,
     ):
 
+        encoder_type = resolve_encoder_type(model_type)
+
         conf = VapConfig()
+        conf.frame_hz = float(frame_rate)
+        conf.encoder_type = encoder_type
+        conf.mimi_model_name = mimi_model_name
+        conf.mimi_use_onnx = 1 if bool(use_mimi_onnx) else 0
+        precision = str(mimi_onnx_precision).strip().lower()
+        if precision not in {"fp32", "int8"}:
+            raise ValueError("mimi_onnx_precision must be 'fp32' or 'int8'.")
+        if str(device).startswith("cuda") and precision == "int8":
+            raise ValueError("mimi_onnx_precision='int8' is not supported with CUDA. Use 'fp32' on CUDA.")
+        conf.mimi_onnx_precision = precision
+        if mimi_onnx_cpu_intra_threads is not None:
+            conf.mimi_onnx_cpu_intra_threads = int(mimi_onnx_cpu_intra_threads)
+        if mimi_onnx_cpu_inter_threads is not None:
+            conf.mimi_onnx_cpu_inter_threads = int(mimi_onnx_cpu_inter_threads)
+        fp32_onnx = mimi_local_onnx_fp32_path or mimi_onnx_fp32_path
+        fp32_meta = mimi_local_onnx_fp32_meta_path or mimi_onnx_fp32_meta_path
+        int8_onnx = mimi_local_onnx_int8_path or mimi_onnx_int8_path
+        int8_meta = mimi_local_onnx_int8_meta_path or mimi_onnx_int8_meta_path
+        if fp32_onnx is not None:
+            conf.mimi_onnx_fp32_path = str(fp32_onnx)
+        if fp32_meta is not None:
+            conf.mimi_onnx_fp32_meta_path = str(fp32_meta)
+        if int8_onnx is not None:
+            conf.mimi_onnx_int8_path = str(int8_onnx)
+        if int8_meta is not None:
+            conf.mimi_onnx_int8_meta_path = str(int8_meta)
+        if cache_dir is not None:
+            conf.mimi_onnx_hf_cache_dir = cache_dir
+        conf.mimi_onnx_hf_force_download = bool(force_download)
 
         # # Middle size model
         # if "middle" in lang:
@@ -60,38 +106,119 @@ class Maai():
         
         elif mode == "nod":
             self.vap = VapGPT_nod(conf)
+
+        elif mode == "nod_para":
+            conf.dropout = 0.2
+            self.vap = VapGPT_nod_para(conf)
         
         elif mode == "vap_prompt":
             from .models.vap_prompt import VapGPT_prompt
             self.vap = VapGPT_prompt(conf)
         
-        self.device = device
+        try:
+            self.device = str(torch.device(device))
+        except RuntimeError as exc:
+            raise ValueError("Device must be a valid torch device string such as 'cpu', 'cuda', or 'cuda:0'.") from exc
 
-        if self.device not in ["cpu", "cuda"]:
-            raise ValueError("Device must be 'cpu' or 'cuda'.")
+        if not (self.device == "cpu" or self.device.startswith("cuda")):
+            raise ValueError("Device must be 'cpu', 'cuda', or 'cuda:N'.")
         
         # Store the initial state of the model to check for unchanged parameters
         initial_state_dict = {name: param.clone() for name, param in self.vap.named_parameters()}
 
+        nod_param_stats_from_file = None
+        nod_count_thresholds_from_file = None
         if local_model is None:
-            sd = load_vap_model(mode, frame_rate, context_len_sec, lang, device, cache_dir, force_download)
+            sd = load_vap_model(
+                mode,
+                frame_rate,
+                context_len_sec,
+                lang,
+                device,
+                cache_dir,
+                force_download,
+                model_type=model_type,
+            )
+            if (
+                mode == "nod_para"
+                and isinstance(sd, dict)
+                and "state_dict" in sd
+            ):
+                nod_param_stats_from_file = sd.get("nod_param_stats")
+                nod_count_thresholds_from_file = sd.get("nod_count_thresholds") or sd.get(
+                    "nod_repetitions_thresholds"
+                )
+                sd = sd["state_dict"]
         else:
             print("Loading model from local file:", local_model)
-            sd = torch.load(local_model, map_location="cpu")
-        
+            raw = torch.load(local_model, map_location="cpu")
+            if isinstance(raw, dict):
+                nod_param_stats_from_file = raw.get("nod_param_stats")
+                nod_count_thresholds_from_file = raw.get(
+                    "nod_count_thresholds"
+                ) or raw.get("nod_repetitions_thresholds")
+                if "state_dict" in raw:
+                    sd = raw["state_dict"]
+                else:
+                    sd = raw
+            else:
+                sd = raw
+
+        if hasattr(self.vap, "conf"):
+            setattr(self.vap.conf, "runtime_device", self.device)
         self.vap.load_encoder(cpc_model=cpc_model)
+        if mode == "nod_para" and isinstance(sd, dict):
+            remapped_sd: dict = {}
+            for _k, _v in sd.items():
+                if _k.startswith("nod_count_head."):
+                    remapped_sd[
+                        "nod_repetitions_head." + _k[len("nod_count_head.") :]
+                    ] = _v
+                else:
+                    remapped_sd[_k] = _v
+            sd = remapped_sd
         self.vap.load_state_dict(sd, strict=False)
 
-        # The downsampling parameters are not loaded by "load_state_dict"
-        self.vap.encoder1.downsample[1].weight = nn.Parameter(sd['encoder.downsample.1.weight'])
-        self.vap.encoder1.downsample[1].bias = nn.Parameter(sd['encoder.downsample.1.bias'])
-        self.vap.encoder1.downsample[2].ln.weight = nn.Parameter(sd['encoder.downsample.2.ln.weight'])
-        self.vap.encoder1.downsample[2].ln.bias = nn.Parameter(sd['encoder.downsample.2.ln.bias'])
+        if (
+            mode == "nod_para"
+            and nod_param_stats_from_file is not None
+            and isinstance(nod_param_stats_from_file, dict)
+        ):
+            for _k in ("range_mean", "range_std", "speed_mean", "speed_std"):
+                if _k in nod_param_stats_from_file:
+                    self.vap.nod_param_stats[_k] = float(nod_param_stats_from_file[_k])
+        if (
+            mode == "nod_para"
+            and nod_count_thresholds_from_file is not None
+            and isinstance(nod_count_thresholds_from_file, dict)
+        ):
+            for _k in ("t0", "t1", "t2"):
+                if _k in nod_count_thresholds_from_file:
+                    self.vap.nod_repetitions_thresholds[_k] = float(
+                        nod_count_thresholds_from_file[_k]
+                    )
+            if "t_swing" in nod_count_thresholds_from_file:
+                self.vap.nod_swing_up_threshold = float(nod_count_thresholds_from_file["t_swing"])
+
+        if conf.encoder_type == "cpc" and 'encoder.downsample.1.weight' in sd:
+            self.vap.encoder1.downsample[1].weight = nn.Parameter(sd['encoder.downsample.1.weight'])
+            self.vap.encoder1.downsample[1].bias = nn.Parameter(sd['encoder.downsample.1.bias'])
+            self.vap.encoder1.downsample[2].ln.weight = nn.Parameter(sd['encoder.downsample.2.ln.weight'])
+            self.vap.encoder1.downsample[2].ln.bias = nn.Parameter(sd['encoder.downsample.2.ln.bias'])
+            
+            self.vap.encoder2.downsample[1].weight = nn.Parameter(sd['encoder.downsample.1.weight'])
+            self.vap.encoder2.downsample[1].bias = nn.Parameter(sd['encoder.downsample.1.bias'])
+            self.vap.encoder2.downsample[2].ln.weight = nn.Parameter(sd['encoder.downsample.2.ln.weight'])
+            self.vap.encoder2.downsample[2].ln.bias = nn.Parameter(sd['encoder.downsample.2.ln.bias'])
         
-        self.vap.encoder2.downsample[1].weight = nn.Parameter(sd['encoder.downsample.1.weight'])
-        self.vap.encoder2.downsample[1].bias = nn.Parameter(sd['encoder.downsample.1.bias'])
-        self.vap.encoder2.downsample[2].ln.weight = nn.Parameter(sd['encoder.downsample.2.ln.weight'])
-        self.vap.encoder2.downsample[2].ln.bias = nn.Parameter(sd['encoder.downsample.2.ln.bias'])
+        # print(sd.keys())
+        # input("Model loaded. Press Enter to continue...")
+        if conf.encoder_type == "mimi" and 'encoder.frame_rate_conv.weight' in sd:
+            self.vap.encoder1.frame_rate_conv.weight = nn.Parameter(sd['encoder.frame_rate_conv.weight'])
+            self.vap.encoder1.frame_rate_conv.bias = nn.Parameter(sd['encoder.frame_rate_conv.bias'])
+            
+            self.vap.encoder2.frame_rate_conv.weight = nn.Parameter(sd['encoder.frame_rate_conv.weight'])
+            self.vap.encoder2.frame_rate_conv.bias = nn.Parameter(sd['encoder.frame_rate_conv.bias'])
 
         # Check for parameters that were not updated from their initial values
         for name, param in self.vap.named_parameters():
@@ -105,6 +232,9 @@ class Maai():
         self.vap = self.vap.eval()
         
         self.mode = mode
+        self.model_type = model_type
+        self.encoder_type = encoder_type
+        self._use_mimi_onnx = bool(use_mimi_onnx)
         self.mic1 = audio_ch1
         self.mic2 = audio_ch2
 
@@ -113,19 +243,20 @@ class Maai():
         self._mic2_queue = self.mic2.subscribe()
 
         self.audio_contenxt_lim_sec = context_len_sec
-        self.frame_rate = frame_rate
+        self.frame_rate = float(frame_rate)
         
         # Context length of the audio embeddings (depends on frame rate)
-        self.audio_context_len = int(self.audio_contenxt_lim_sec * self.frame_rate)
+        self.audio_context_len = int(round(self.audio_contenxt_lim_sec * self.frame_rate))
         
         self.sampling_rate = 16000
-        self.frame_contxt_padding = 320 # Independe from frame size
+        self.frame_contxt_padding = 320
         
         # Frame size
         # 10Hz -> 320 + 1600 samples
+        # 12.5Hz -> 320 + 1280 samples
         # 20Hz -> 320 + 800 samples
         # 50Hz -> 320 + 320 samples
-        self.audio_frame_size = self.sampling_rate // self.frame_rate + self.frame_contxt_padding
+        self.audio_frame_size = int(round(self.sampling_rate / self.frame_rate)) + self.frame_contxt_padding
         
         self.current_x1_audio = []
         self.current_x2_audio = []
@@ -158,6 +289,37 @@ class Maai():
         # Thread control
         self._stop_event = threading.Event()
         self._worker_thread = None
+
+        self.reset_runtime_state()
+
+    def reset_runtime_state(self):
+        self.current_x1_audio = []
+        self.current_x2_audio = []
+        self.e1_full = []
+        self.e2_full = []
+        self.vap_cache = None
+        self._skip_first_encoder_output = bool(self.encoder_type == "mimi" and self._use_mimi_onnx)
+
+        for encoder_name in ["encoder1", "encoder2"]:
+            encoder = getattr(self.vap, encoder_name, None)
+            if encoder is not None and hasattr(encoder, "reset_streaming_state"):
+                encoder.reset_streaming_state()
+
+    # def _increase_mimi_chunk_threshold(self, attempted_num_samples: int):
+    #     if self.encoder_type != "mimi":
+    #         return
+
+    #     previous_threshold = int(self.audio_frame_size)
+    #     next_threshold = int(attempted_num_samples) + int(Base.FRAME_SIZE)
+    #     if next_threshold <= self.audio_frame_size:
+    #         next_threshold = self.audio_frame_size + int(Base.FRAME_SIZE)
+
+    #     self.audio_frame_size = next_threshold
+    #     if self.audio_frame_size != previous_threshold:
+    #         print(
+    #             f"[Info] Mimi streaming chunk threshold adjusted: {previous_threshold} -> {self.audio_frame_size} samples "
+    #             f"({self.audio_frame_size / self.sampling_rate:.3f} sec)."
+    #         )
     
     def worker(self):
         
@@ -189,6 +351,8 @@ class Maai():
             # self._mic2_queue.queue.clear()
 
     def start(self):
+
+        self.reset_runtime_state()
 
         self.mic1.start()
         self.mic2.start()
@@ -223,6 +387,8 @@ class Maai():
             self._mic2_queue.queue.clear()
         except Exception:
             pass
+
+        self.reset_runtime_state()
     
     def process(self, x1, x2):
         
@@ -252,7 +418,7 @@ class Maai():
         x1_dist = x1_proc[self.frame_contxt_padding:]
         x2_dist = x2_proc[self.frame_contxt_padding:]
 
-        with torch.no_grad():
+        with torch.inference_mode():
             # Create tensors more efficiently with specified dtype and device
             x1_ = torch.from_numpy(x1_proc).float().unsqueeze(0).unsqueeze(0)
             x2_ = torch.from_numpy(x2_proc).float().unsqueeze(0).unsqueeze(0)
@@ -262,7 +428,45 @@ class Maai():
                 x1_ = x1_.to(self.device, non_blocking=True)
                 x2_ = x2_.to(self.device, non_blocking=True)
 
+            # try:
             e1, e2 = self.vap.encode_audio(x1_, x2_)
+            # except RuntimeError as exc:
+            #     short_chunk_error = (
+            #         self.encoder_type == "mimi"
+            #         and "Calculated padded input size per channel" in str(exc)
+            #         and "Kernel size can't be greater than actual input size" in str(exc)
+            #     )
+            #     if short_chunk_error:
+            #         self._increase_mimi_chunk_threshold(len(self.current_x1_audio))
+            #         self.process_time_abs = time.time()
+            #         return
+            #     raise
+
+            if e1.shape[1] == 0 or e2.shape[1] == 0:
+                # if self.encoder_type == "mimi":
+                #     self._increase_mimi_chunk_threshold(len(self.current_x1_audio))
+                # self.process_time_abs = time.time()
+                if self.frame_contxt_padding > 0:
+                    self.current_x1_audio = self.current_x1_audio[-self.frame_contxt_padding:].copy()
+                    self.current_x2_audio = self.current_x2_audio[-self.frame_contxt_padding:].copy()
+                else:
+                    self.current_x1_audio = np.empty(0, dtype=np.float32)
+                    self.current_x2_audio = np.empty(0, dtype=np.float32)
+                print("[Warning] No audio features extracted. Skipping this frame.")
+                return
+
+            # Skip the first Mimi encoder output to avoid the startup-only mismatch
+            # between ONNX and PyTorch cache warmup behavior.
+            if self._skip_first_encoder_output:
+                self._skip_first_encoder_output = False
+                self.process_time_abs = time.time()
+                if self.frame_contxt_padding > 0:
+                    self.current_x1_audio = self.current_x1_audio[-self.frame_contxt_padding:].copy()
+                    self.current_x2_audio = self.current_x2_audio[-self.frame_contxt_padding:].copy()
+                else:
+                    self.current_x1_audio = np.empty(0, dtype=np.float32)
+                    self.current_x2_audio = np.empty(0, dtype=np.float32)
+                return
 
             # Full model
             if not self.use_kv_cache:
@@ -346,7 +550,16 @@ class Maai():
                     "p_nod_short": out['p_nod_short'],
                     "p_nod_long": out['p_nod_long'],
                     "p_nod_long_p": out['p_nod_long_p']
-                }
+                },
+                "nod_para": lambda: {
+                    "p_nod": out["p_nod"],
+                    "nod_repetitions": out["nod_repetitions"],
+                    "nod_repetitions_pred": out["nod_repetitions_pred"],
+                    "nod_range": out["nod_range"],
+                    "nod_speed": out["nod_speed"],
+                    "nod_swing_up": out["nod_swing_up"],
+                    "nod_swing_up_pred": out["nod_swing_up_pred"],
+                },
             }
             
             # Get mode-specific outputs
@@ -364,14 +577,21 @@ class Maai():
                 num_process_frame = len(self.list_process_time_context) / (time.time() - self.last_interval_time)
                 self.last_interval_time = time.time()
 
-                print(f'[{self.mode}] Average processing time: {ave_proc_time:.5f} [sec], #process/sec: {num_process_frame:.3f}')
+                perf_message = f'[{self.mode}] Average processing time: {ave_proc_time:.5f} [sec], #process/sec: {num_process_frame:.3f}'
+                if self.encoder_type == "mimi":
+                    perf_message += f', chunk_samples: {self.audio_frame_size}'
+                print(perf_message)
                 self.list_process_time_context.clear()  # clear() is faster than = []
             
             self.process_time_abs = time.time()
 
         # Keep only the last samples in the buffer (use views for efficiency)
-        self.current_x1_audio = self.current_x1_audio[-self.frame_contxt_padding:].copy()
-        self.current_x2_audio = self.current_x2_audio[-self.frame_contxt_padding:].copy()
+        if self.frame_contxt_padding > 0:
+            self.current_x1_audio = self.current_x1_audio[-self.frame_contxt_padding:].copy()
+            self.current_x2_audio = self.current_x2_audio[-self.frame_contxt_padding:].copy()
+        else:
+            self.current_x1_audio = np.empty(0, dtype=np.float32)
+            self.current_x2_audio = np.empty(0, dtype=np.float32)
     
     def get_result(self):
         return self.result_dict_queue.get()

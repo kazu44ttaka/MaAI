@@ -118,19 +118,35 @@ while True:
 ## Parameters
 
 The available parameters are summarized below.
+`model_type` selects the model variant.
+
+- `"normal"`: the existing model variant used in previous releases
+- `"normal-ver2"`: the Mimi-based model variant
+
 `frame_rate` specifies the number of samples processed per second by the VAP model.
 Please adjust this value according to your computing environment.
 
-| `lang` | `frame_rate` |
-| --- | --- |
-| jp | 5, 10, 20 |
-| jp_kyoto | 5, 10, 20 |
-| en | 5, 10, 20 |
-| en_kyoto | 5, 10, 20 |
-| ch | 5, 10, 20 |
-| ch_kyoto | 5, 10, 20 |
-| tri | 5, 10, 20 |
-| tri_kyoto | 5, 10, 20 |
+For `model_type="normal"`, the available `frame_rate` values are shown in the table below.
+For `model_type="normal-ver2"`, only `frame_rate=12.5` is supported.
+
+| `lang` | `model_type` | `frame_rate` |
+| --- | --- | --- |
+| jp | normal | 5, 10, 20 |
+| jp | normal-ver2 | 12.5 |
+| jp_kyoto | normal | 5, 10, 20 |
+| jp_kyoto | normal-ver2 | 12.5 |
+| en | normal | 5, 10, 20 |
+| en | normal-ver2 | 12.5 |
+| en_kyoto | normal | 5, 10, 20 |
+| en_kyoto | normal-ver2 | 12.5 |
+| ch | normal | 5, 10, 20 |
+| ch | normal-ver2 | 12.5 |
+| ch_kyoto | normal | 5, 10, 20 |
+| ch_kyoto | normal-ver2 | 12.5 |
+| tri | normal | 5, 10, 20 |
+| tri | normal-ver2 | 12.5 |
+| tri_kyoto | normal | 5, 10, 20 |
+| tri_kyoto | normal-ver2 | 12.5 |
 
 </br>
 

@@ -117,19 +117,35 @@ while True:
 ## パラメータ
 
 利用可能なパラメータを以下にまとめます。
+`model_type` はモデル種別を指定します。
+
+- `"normal"`: これまでのリリースで使っていた既存モデル
+- `"normal-ver2"`: Mimi ベースの新しいモデル
+
 `frame_rate` はVAPモデルが1秒あたりに処理するサンプル数を指定します。
 ご利用の計算環境に合わせて、この値を調整してください。
 
-| `lang` | `frame_rate` |
-| --- | --- |
-| jp | 5, 10, 20 |
-| jp_kyoto | 5, 10, 20 |
-| en | 5, 10, 20 |
-| en_kyoto | 5, 10, 20 |
-| ch | 5, 10, 20 |
-| ch_kyoto | 5, 10, 20 |
-| tri | 5, 10, 20 |
-| tri_kyoto | 5, 10, 20 |
+`model_type="normal"` の場合に利用可能な `frame_rate` は下表のとおりです。
+`model_type="normal-ver2"` の場合は `frame_rate=12.5` のみ対応しています。
+
+| `lang` | `model_type` | `frame_rate` |
+| --- | --- | --- |
+| jp | normal | 5, 10, 20 |
+| jp | normal-ver2 | 12.5 |
+| jp_kyoto | normal | 5, 10, 20 |
+| jp_kyoto | normal-ver2 | 12.5 |
+| en | normal | 5, 10, 20 |
+| en | normal-ver2 | 12.5 |
+| en_kyoto | normal | 5, 10, 20 |
+| en_kyoto | normal-ver2 | 12.5 |
+| ch | normal | 5, 10, 20 |
+| ch | normal-ver2 | 12.5 |
+| ch_kyoto | normal | 5, 10, 20 |
+| ch_kyoto | normal-ver2 | 12.5 |
+| tri | normal | 5, 10, 20 |
+| tri | normal-ver2 | 12.5 |
+| tri_kyoto | normal | 5, 10, 20 |
+| tri_kyoto | normal-ver2 | 12.5 |
 
 <br>
 

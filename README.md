@@ -45,6 +45,7 @@ __Demo video on YouTube__ (https://www.youtube.com/watch?v=-uwB6yl2WtI)
 
 ## 🆕 Update
 
+- We released a new version of MaAI (version 0.2.0) with a significant performance improvement (April 17th, 2026)
 - [Backchannel prediction model](readme/vap_bc.md) supporting three languages (English, Chinese, and Japanese) is now available (November 19th, 2025)
 - Computational efficiency is improved in the long-context models (September 3rd, 2025)
 - We launched the MaAI project and repository here! 🚀  (August 13th, 2025)
@@ -80,6 +81,11 @@ while True:
     maai_output_bar.update(result)
 ```
 
+`Maai` now accepts `model_type` to select the model variant.
+
+- `"normal"`: the existing default model variant used in previous releases
+- `"normal-ver2"`: a new model variant that uses the Mimi encoder
+
 <br>
 
 ## 🧩 Models
@@ -108,6 +114,7 @@ Backchannels are short listener responses such as `yeah` and `oh`, that are also
 Nodding refers to the up-and-down movement of the head and is closely related to backchanneling. Unlike backchannels that involve vocal responses, nodding allows the listener to express their reaction non-verbally.
 
 - [VAP-based Nodding Prediction Model](readme/vap_nod.md)
+- [VAP-based Nodding Prediction Model with Kinematic Parameter](readme/vap_nod_para.md)
 
 <br>
 
@@ -158,7 +165,10 @@ You can find example implementations of MaAI models in the [example](example) di
     - [With 1 mic input](example/bc_2type/bc_2type_mic.py) 🎤
 
 - Nodding
-    - [With 1 mic input](example/nod/nod_mic.py) 🎤
+    - Prediction of three types of nodding 
+        - [With 1 mic input](example/nod/nod_mic.py) 🎤
+    - Prediction of kinematic parameter of nodding
+        - [With 1 mic input](example/nod/nod_para_mic.py) 🎤
 
 - Output
     - [Console Dynamic Output](example/output/vap_2wav_ConsoleBar.py) 📊
@@ -245,6 +255,10 @@ https://aclanthology.org/2025.naacl-long.367/<br>
 
 The source code in this repository is licensed under the MIT License.
 For the trained models, please follow the license described in the README of each model or on Hugging Face repository.
+
+When you use `model_type="normal-ver2"`, MaAI uses the Mimi encoder.
+Mimi is available at https://huggingface.co/kyutai/mimi and is licensed under CC BY 4.0.
+MaAI uses Mimi as an encoder without modifying Mimi itself, and combines it with a separate downstream model.
 
 The pre-trained CPC model is from the original CPC project and please follow its specific license.
 Refer to the original repository at https://github.com/facebookresearch/CPC_audio for more details.

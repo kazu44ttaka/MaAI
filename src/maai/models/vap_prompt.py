@@ -5,7 +5,7 @@ from typing import Optional, Tuple
 import torch.nn.functional as F
 
 from .config import VapConfig
-from ..encoder import EncoderCPC
+from ..encoder import build_audio_encoder
 from ..modules import GPT, GPTStereo
 from ..objective import ObjectiveVAP
 
@@ -83,26 +83,14 @@ class VapGPT_prompt(nn.Module):
         self.set_prompt_ch2("発話前に少し間を取り、考えてから丁寧に話し始めてください。応答は急がず、落ち着いたテンポを意識してください。")
 
     def load_encoder(self, cpc_model):
-        
-        # Audio Encoder
-        #if self.conf.encoder_type == "cpc":
-        self.encoder1 = EncoderCPC(
-            load_pretrained=True if self.conf.load_pretrained == 1 else False,
-            freeze=self.conf.freeze_encoder,
-            cpc_model=cpc_model
-        )
+        self.encoder1 = build_audio_encoder(self.conf, cpc_model=cpc_model)
         self.encoder1 = self.encoder1.eval()
-        #print(self.encoder1)
-        #self.encoder1 = self.encoder1.half()
-        
-        self.encoder2 = EncoderCPC(
-            load_pretrained=True if self.conf.load_pretrained == 1 else False,
-            freeze=self.conf.freeze_encoder,
-            cpc_model=cpc_model
-        )
-
+        self.encoder2 = build_audio_encoder(self.conf, cpc_model=cpc_model)
         self.encoder2 = self.encoder2.eval()
-        #self.encoder2 = self.encoder2.half()
+
+        encoder_dim = getattr(self.encoder1, "output_dim", self.conf.dim)
+        if encoder_dim != self.conf.dim:
+            self.decrease_dimension = nn.Linear(encoder_dim, self.conf.dim)
         
         if self.conf.freeze_encoder == 1:
             print('freeze encoder')
@@ -117,6 +105,10 @@ class VapGPT_prompt(nn.Module):
         
         x1 = self.encoder1(audio1)  # speaker 1
         x2 = self.encoder2(audio2)  # speaker 2
+
+        if hasattr(self, "decrease_dimension"):
+            x1 = self.decrease_dimension(x1)
+            x2 = self.decrease_dimension(x2)
         
         return x1, x2
 
@@ -203,6 +195,8 @@ class VapGPT_prompt(nn.Module):
             o2_concat,
             past_kv1=cache.get("cross1"),
             past_kv2=cache.get("cross2"),
+            past_kv1_c=cache.get("cross1_c"),
+            past_kv2_c=cache.get("cross2_c"),
         )
 
         new_cache = {
@@ -210,6 +204,8 @@ class VapGPT_prompt(nn.Module):
             "ar2": (o2["past_k"], o2["past_v"]),
             "cross1": (out["past_k1"], out["past_v1"]),
             "cross2": (out["past_k2"], out["past_v2"]),
+            "cross1_c": (out["past_k1_c"], out["past_v1_c"]),
+            "cross2_c": (out["past_k2_c"], out["past_v2_c"]),
         }
 
         # Outputs
