@@ -121,7 +121,7 @@ The available parameters are summarized below.
 `model_type` selects the model variant.
 
 - `"normal"`: the existing model variant used in previous releases
-- `"normal-ver2"`: the Mimi-based model variant
+- `"normal-ver2"`: a new model variant that uses Mimi as the encoder
 
 `frame_rate` specifies the number of samples processed per second by the VAP model.
 Please adjust this value according to your computing environment.
