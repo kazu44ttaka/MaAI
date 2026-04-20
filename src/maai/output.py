@@ -1,7 +1,7 @@
 import sys
 import math
 import time
-from typing import Dict, Any, List, Union
+from typing import Any, Callable, Dict, List, Union
 import numpy as np
 import socket
 import threading
@@ -11,6 +11,85 @@ import queue
 from . import util
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+
+DEFAULT_VAP_BIN_TIMES_SEC = [0.2, 0.4, 0.6, 0.8]
+
+# GuiPlot 専用: 先に QApplication が無いときだけデーモンスレッドで Qt を回し、
+# メインが sleep だけでもワーカーから update() できるようにする。
+_gui_plot_qt_lock = threading.Lock()
+_gui_plot_qt_thread: threading.Thread | None = None
+_gui_plot_qt_owner_ident: int | None = None
+_gui_plot_qt_cmd_q: queue.Queue | None = None
+_gui_plot_qt_ready = threading.Event()
+_gui_plot_use_dedicated_qt_thread: bool = False
+
+
+def _gui_plot_qt_owner_thread_main() -> None:
+    global _gui_plot_qt_owner_ident, _gui_plot_qt_cmd_q
+    from PyQt5.QtWidgets import QApplication
+
+    _gui_plot_qt_owner_ident = threading.get_ident()
+    _gui_plot_qt_cmd_q = queue.Queue()
+    argv = sys.argv[:] if sys.argv else [""]
+    if len(argv) == 0:
+        argv = [""]
+    app = QApplication(argv)
+    _gui_plot_qt_ready.set()
+    while True:
+        try:
+            while True:
+                fn, retq = _gui_plot_qt_cmd_q.get_nowait()
+                try:
+                    fn()
+                    if retq is not None:
+                        retq.put((True, None))
+                except BaseException as exc:  # noqa: BLE001
+                    if retq is not None:
+                        retq.put((False, exc))
+        except queue.Empty:
+            pass
+        app.processEvents()
+        time.sleep(1.0 / 120.0)
+
+
+def _ensure_gui_plot_qt_owner() -> None:
+    """先に QApplication が無い場合のみ専用スレッドを起動する。"""
+    global _gui_plot_qt_thread, _gui_plot_use_dedicated_qt_thread
+    from PyQt5.QtWidgets import QApplication
+
+    with _gui_plot_qt_lock:
+        if _gui_plot_qt_thread is not None and _gui_plot_qt_thread.is_alive():
+            return
+        if QApplication.instance() is not None:
+            _gui_plot_use_dedicated_qt_thread = False
+            return
+        _gui_plot_use_dedicated_qt_thread = True
+        _gui_plot_qt_ready.clear()
+        _gui_plot_qt_thread = threading.Thread(
+            target=_gui_plot_qt_owner_thread_main,
+            daemon=True,
+            name="MaAI-GuiPlot-Qt",
+        )
+        _gui_plot_qt_thread.start()
+        if not _gui_plot_qt_ready.wait(30.0):
+            raise RuntimeError("GuiPlot: Qt オーナースレッドの起動がタイムアウトしました。")
+
+
+def _gui_plot_run_on_qt_owner(fn: Callable[[], Any]) -> None:
+    """専用 Qt スレッド上で fn を実行。それ以外のスレッドからはキュー経由で同期実行。"""
+    if not _gui_plot_use_dedicated_qt_thread:
+        fn()
+        return
+    assert _gui_plot_qt_cmd_q is not None
+    if threading.get_ident() == _gui_plot_qt_owner_ident:
+        fn()
+        return
+    retq: queue.Queue = queue.Queue(maxsize=1)
+    _gui_plot_qt_cmd_q.put((fn, retq))
+    ok, payload = retq.get()
+    if not ok:
+        raise payload
+
 
 def _draw_bar(value: float, length: int = 30) -> str:
     """基本的なバーグラフを描画"""
@@ -234,7 +313,7 @@ class ConsoleBar:
     
         # 各キーを動的に処理
         for key, value in result.items():
-            if key == 't' or key == 'vad':
+            if key in ("t", "vad", "bin_times"):
                 continue
             if key in skip_nod_para:
                 continue
@@ -243,6 +322,25 @@ class ConsoleBar:
                 continue
             if not isinstance(value, (float, int)):
                 value = np.squeeze(np.array(value)).tolist()
+            if (
+                key == "p_bins"
+                and isinstance(value, list)
+                and len(value) == 2
+                and isinstance(value[0], list)
+            ):
+                for si, spk_bins in enumerate(value):
+                    bins_str = ", ".join(f"{b:.3f}" for b in spk_bins)
+                    bar = _draw_bar(float(np.mean(spk_bins)), self.bar_length)
+                    print(f"{'p_bins(spk'+str(si+1)+')':15}: {bar} [{bins_str}]")
+                continue
+            if (
+                key in ("p_bins_now", "p_bins_future")
+                and isinstance(value, list)
+                and len(value) == 2
+            ):
+                a, b = float(value[0]), float(value[1])
+                print(f"{key:15}: spk1={a:.4f}  spk2={b:.4f}  (ビン合計÷2、各話者 [0,1])")
+                continue
             bar, _value = _get_bar_for_value(key, value, self.bar_length, self.bar_type)
             if type(_value) is float:
                 print(f"{key:15}: {bar} ({_value:.3f})")
@@ -439,8 +537,39 @@ class GuiPlot:
         sample_rate: int = 16000,
         figsize=(14, 10),
         use_fixed_draw_rate: bool = True,
+        window_title: str = "MAAI Plot",
+    ) -> None:
+        _ensure_gui_plot_qt_owner()
+
+        def _boot() -> None:
+            self._bootstrap_ui(
+                shown_context_sec=shown_context_sec,
+                frame_rate=frame_rate,
+                sample_rate=sample_rate,
+                figsize=figsize,
+                use_fixed_draw_rate=use_fixed_draw_rate,
+                window_title=window_title,
+                use_cross_thread_bridge=not _gui_plot_use_dedicated_qt_thread,
+            )
+
+        if _gui_plot_use_dedicated_qt_thread:
+            _gui_plot_run_on_qt_owner(_boot)
+        else:
+            _boot()
+
+    def _bootstrap_ui(
+        self,
+        *,
+        shown_context_sec: int,
+        frame_rate: float,
+        sample_rate: int,
+        figsize: Any,
+        use_fixed_draw_rate: bool,
+        window_title: str,
+        use_cross_thread_bridge: bool,
     ) -> None:
         try:
+            from PyQt5.QtCore import QObject, Qt, QThread, pyqtSignal
             from PyQt5.QtWidgets import QApplication, QVBoxLayout, QWidget
 
             import pyqtgraph as pg
@@ -457,7 +586,8 @@ class GuiPlot:
             self._app = QApplication.instance()
 
         self._root = QWidget()
-        self._root.setWindowTitle("MAAI Plot")
+        self._window_title = str(window_title)
+        self._root.setWindowTitle(self._window_title)
         fw = max(800, int(figsize[0] * 100))
         fh = max(600, int(figsize[1] * 100))
         self._root.resize(fw, fh)
@@ -484,6 +614,29 @@ class GuiPlot:
 
         self._x_wav = np.linspace(-self.shown_context_sec, 0.0, self.MAX_CONTEXT_WAV_LEN)
         self._x_ctx = np.linspace(-self.shown_context_sec, 0.0, self.MAX_CONTEXT_LEN)
+
+        self._update_bridge: Any = None
+        if use_cross_thread_bridge:
+
+            class _GuiPlotUpdateBridge(QObject):
+                """threading.Thread 等からの update を Qt GUI スレッドへキューする。"""
+
+                request = pyqtSignal(object)
+
+                def __init__(self, owner: "GuiPlot") -> None:
+                    super().__init__(owner._root)
+                    self.request.connect(owner._update_impl, type=Qt.QueuedConnection)
+
+            self._update_bridge = _GuiPlotUpdateBridge(self)
+
+    def set_window_title(self, title: str) -> None:
+        """ウィンドウのタイトルバーに表示する文字列を変更する。"""
+
+        def _apply() -> None:
+            self._window_title = str(title)
+            self._root.setWindowTitle(self._window_title)
+
+        _gui_plot_run_on_qt_owner(_apply)
 
     @staticmethod
     def _expand_threshold_crossings(x: np.ndarray, y: np.ndarray, th: float) -> tuple[np.ndarray, np.ndarray]:
@@ -531,6 +684,70 @@ class GuiPlot:
         except Exception:
             return 0.0
 
+    def _draw_p_bins_pg(self, plot: Any, arr: np.ndarray, bin_times_value: Any) -> None:
+        """2話者×ビン確率を、ビン幅に比例した横軸（将来時刻の累積秒）で描画する。"""
+        import pyqtgraph as pg
+
+        arr = np.asarray(arr, dtype=float)
+        plot.clear()
+        if arr.ndim != 2 or arr.shape[0] != 2:
+            plot.setTitle(f"p_bins (invalid shape: {arr.shape})")
+            return
+        n_bins = int(arr.shape[1])
+        try:
+            bin_times = [float(x) for x in (bin_times_value or DEFAULT_VAP_BIN_TIMES_SEC)]
+        except Exception:
+            bin_times = list(DEFAULT_VAP_BIN_TIMES_SEC)
+        if len(bin_times) != n_bins:
+            bin_times = [1.0 for _ in range(n_bins)]
+        edges = np.concatenate([[0.0], np.cumsum(bin_times)])
+
+        plot.setTitle("p_bins (per-bin probability at current time)")
+        plot.showGrid(x=True, y=True, alpha=0.15)
+        plot.setMenuEnabled(False)
+        plot.setMouseEnabled(x=False, y=False)
+        plot.hideButtons()
+        plot.setXRange(0.0, float(edges[-1]), padding=0.0)
+        plot.setYRange(0.0, 2.0, padding=0.0)
+        plot.setLabel("bottom", "Future time [s] (bin edges)")
+        plot.setLabel("left", "Speaker")
+        try:
+            plot.getAxis("left").setTicks([[(0.5, "spk2"), (1.5, "spk1")]])
+        except Exception:
+            pass
+
+        plot.addLine(y=1.0, pen=pg.mkPen((130, 130, 130), width=1))
+        vpen = pg.mkPen((130, 130, 130), width=1, style=pg.QtCore.Qt.DashLine)
+        for x in edges[1:-1]:
+            plot.addLine(x=float(x), pen=vpen)
+
+        for s in range(2):
+            y0 = 1.0 if s == 0 else 0.0
+            for b in range(n_bins):
+                v = float(np.clip(arr[s, b], 0.0, 1.0))
+                x0 = float(edges[b])
+                w = float(bin_times[b])
+                # 上段 spk1 = 黄、下段 spk2 = 青（p_now / x2 と揃える）
+                hue_base = (245, 189, 0) if s == 0 else (80, 160, 240)
+                color = (
+                    int(hue_base[0] * (0.35 + 0.65 * v)),
+                    int(hue_base[1] * (0.35 + 0.65 * v)),
+                    int(hue_base[2] * (0.35 + 0.65 * v)),
+                )
+                bar = pg.BarGraphItem(
+                    x=[x0 + (w / 2.0)],
+                    width=[w],
+                    y0=[y0],
+                    height=[1.0],
+                    brush=pg.mkBrush(color),
+                    pen=pg.mkPen((30, 30, 30), width=0.8),
+                )
+                plot.addItem(bar)
+                txt_color = (255, 255, 255) if v >= 0.55 else (20, 20, 20)
+                txt = pg.TextItem(text=f"{v:.2f}", color=txt_color, anchor=(0.5, 0.5))
+                txt.setPos(x0 + (w / 2.0), y0 + 0.5)
+                plot.addItem(txt)
+
     def _cfg(self, plot: Any, title: str) -> None:
         plot.setTitle(title)
         plot.showGrid(x=True, y=True, alpha=0.15)
@@ -549,9 +766,17 @@ class GuiPlot:
             "p_future",
             "p_bins",
             "vad",
+            "p_bins_now",
+            "p_bins_future",
             "silero_vad_score",
         ]
-        _skip_plot_keys = frozenset({"nod_repetitions_pred", "nod_swing_up_pred"})
+        _skip_plot_keys = frozenset(
+            {
+                "nod_repetitions_pred",
+                "nod_swing_up_pred",
+                "bin_times",
+            }
+        )
         self.keys = [k for k in special_keys if k in result] + [
             k
             for k in result.keys()
@@ -642,6 +867,32 @@ class GuiPlot:
                 )
                 self.curves[key] = (c1, c2)
                 self.data_buffer[key] = [list(b1), list(b2)]
+            elif key in ("p_bins_now", "p_bins_future"):
+                title = (
+                    "p_bins_now (bins 0–1 sum ÷2, spk ∈ [0,1])"
+                    if key == "p_bins_now"
+                    else "p_bins_future (bins 2–3 sum ÷2, spk ∈ [0,1])"
+                )
+                self._cfg(p, title)
+                p.setYRange(-1.0, 1.0, padding=0.0)
+                b1 = np.zeros(self.MAX_CONTEXT_LEN, dtype=float)
+                b2 = np.zeros(self.MAX_CONTEXT_LEN, dtype=float)
+                c1 = p.plot(
+                    self._x_ctx,
+                    b1,
+                    pen=pg.mkPen((245, 189, 0), width=1.5),
+                    fillLevel=0.0,
+                    brush=self._pg.mkBrush(245, 189, 0, 90),
+                )
+                c2 = p.plot(
+                    self._x_ctx,
+                    -b2,
+                    pen=pg.mkPen((80, 160, 240), width=1.5),
+                    fillLevel=0.0,
+                    brush=self._pg.mkBrush(80, 160, 240, 90),
+                )
+                self.curves[key] = (c1, c2)
+                self.data_buffer[key] = [list(b1), list(b2)]
             elif key == "silero_vad_score":
                 self._cfg(p, "Silero VAD score")
                 p.setYRange(0.0, 1.0, padding=0.0)
@@ -690,10 +941,10 @@ class GuiPlot:
                 self.curves[key] = c
                 self.data_buffer[key] = list(buf)
             elif key == "p_bins":
-                self._cfg(p, "p_bins (matrix snapshot)")
-                p.setYRange(0.0, 2.0, padding=0.0)
-                self.data_buffer[key] = np.asarray(val, dtype=float)
+                arr = np.asarray(val, dtype=float)
+                self.data_buffer[key] = arr
                 self.curves[key] = None
+                self._draw_p_bins_pg(p, arr, result.get("bin_times"))
             elif key.startswith("p_"):
                 self._cfg(p, key)
                 p.setYRange(0.0, 1.0, padding=0.0)
@@ -732,6 +983,18 @@ class GuiPlot:
         self.initialized = True
 
     def update(self, result: Dict[str, Any]) -> None:
+        """どのスレッドから呼んでも安全。"""
+        if _gui_plot_use_dedicated_qt_thread:
+            _gui_plot_run_on_qt_owner(lambda: self._update_impl(result))
+            return
+        from PyQt5.QtCore import QThread
+
+        if self._update_bridge is not None and QThread.currentThread() is not self._root.thread():
+            self._update_bridge.request.emit(result)
+            return
+        self._update_impl(result)
+
+    def _update_impl(self, result: Dict[str, Any]) -> None:
         from PyQt5.QtWidgets import QApplication
 
         draw = True
@@ -795,6 +1058,27 @@ class GuiPlot:
                     c1, c2 = self.curves[key]
                     c1.setData(x, np.maximum(a1, 0.0))
                     c2.setData(x, -np.maximum(a2, 0.0))
+            elif key in ("p_bins_now", "p_bins_future") and key in self.curves:
+                b1, b2 = self.data_buffer[key]
+                arr = np.asarray(val, dtype=float).reshape(-1)
+                v1 = float(arr[0]) if arr.size > 0 else 0.0
+                v2 = float(arr[1]) if arr.size > 1 else 0.0
+                v1 = max(0.0, v1)
+                v2 = max(0.0, v2)
+                b1 = list(b1) + [v1]
+                b2 = list(b2) + [v2]
+                if len(b1) > self.MAX_CONTEXT_LEN:
+                    b1 = b1[-self.MAX_CONTEXT_LEN :]
+                if len(b2) > self.MAX_CONTEXT_LEN:
+                    b2 = b2[-self.MAX_CONTEXT_LEN :]
+                self.data_buffer[key] = [b1, b2]
+                if draw:
+                    x = np.linspace(-self.shown_context_sec, 0.0, len(b1))
+                    a1 = np.asarray(b1, dtype=float)
+                    a2 = np.asarray(b2, dtype=float)
+                    c1, c2 = self.curves[key]
+                    c1.setData(x, np.maximum(a1, 0.0))
+                    c2.setData(x, -np.maximum(a2, 0.0))
             elif key == "silero_vad_score" and key in self.curves:
                 buf = self.data_buffer[key]
                 try:
@@ -818,7 +1102,13 @@ class GuiPlot:
                 if draw:
                     x = np.linspace(-self.shown_context_sec, 0.0, len(buf))
                     self.curves[key].setData(x, np.asarray(buf, dtype=float))
-            elif key.startswith("p_") and key not in ("p_now", "p_future", "p_bins") and key in self.curves:
+            elif key.startswith("p_") and key not in (
+                "p_now",
+                "p_future",
+                "p_bins",
+                "p_bins_now",
+                "p_bins_future",
+            ) and key in self.curves:
                 buf = self.data_buffer[key]
                 try:
                     fv = float(val)
@@ -831,8 +1121,11 @@ class GuiPlot:
                 if draw:
                     x = np.linspace(-self.shown_context_sec, 0.0, len(buf))
                     self.curves[key].setData(x, np.clip(np.asarray(buf, dtype=float), 0.0, 1.0))
-            elif key == "p_bins":
-                self.data_buffer[key] = np.asarray(val, dtype=float)
+            elif key == "p_bins" and key in self.plots:
+                arr = np.asarray(val, dtype=float)
+                self.data_buffer[key] = arr
+                if draw:
+                    self._draw_p_bins_pg(self.plots[key], arr, result.get("bin_times"))
             elif key in self.curves and self.curves[key] is not None:
                 buf = self.data_buffer[key]
                 if isinstance(val, (np.ndarray, list, tuple)) and len(np.asarray(val).reshape(-1)) > 1:

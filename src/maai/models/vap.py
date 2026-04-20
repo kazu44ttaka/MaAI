@@ -142,6 +142,16 @@ class VapGPT(nn.Module):
 
         probs = logits.softmax(dim=-1)
 
+        p_bins_tensor = self.objective.probs_speaker_bin_aggregate(
+            probs, from_bin=0, to_bin=self.objective.n_bins - 1
+        )
+
+        # 話者次元は正規化せず、該当ビン（p_now / p_future と同じ範囲）の値を足したもの
+        i0, i1 = self.BINS_P_NOW[0], self.BINS_P_NOW[-1]
+        j0, j1 = self.BINS_PFUTURE[0], self.BINS_PFUTURE[-1]
+        p_bins_now_t = p_bins_tensor[:, :, :, i0 : i1 + 1].sum(dim=-1)
+        p_bins_future_t = p_bins_tensor[:, :, :, j0 : j1 + 1].sum(dim=-1)
+
         p_now = self.objective.probs_next_speaker_aggregate(
             probs,
             from_bin=self.BINS_P_NOW[0],
@@ -154,13 +164,23 @@ class VapGPT(nn.Module):
             to_bin=self.BINS_PFUTURE[1],
         )
 
-        # Get back to the CPU
+        # Get back to the CPU（ビン合計は最大 2 なので 2 で割り各話者 [0, 1] に正規化）
+        p_bins = p_bins_tensor.to("cpu").tolist()[0][-1]
+        p_bins_now = (p_bins_now_t * 0.5).to("cpu").tolist()[0][-1]
+        p_bins_future = (p_bins_future_t * 0.5).to("cpu").tolist()[0][-1]
         p_now = p_now.to("cpu").tolist()[0][-1]
         p_future = p_future.to("cpu").tolist()[0][-1]
 
         vad1 = vad1.sigmoid().to("cpu").tolist()[0][-1][0]
         vad2 = vad2.sigmoid().to("cpu").tolist()[0][-1][0]
 
-        ret = {"p_now": p_now, "p_future": p_future, "vad": [vad1, vad2]}
+        ret = {
+            "p_now": p_now,
+            "p_future": p_future,
+            "vad": [vad1, vad2],
+            "p_bins": p_bins,
+            "p_bins_now": p_bins_now,
+            "p_bins_future": p_bins_future,
+        }
 
         return ret, new_cache

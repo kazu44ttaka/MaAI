@@ -53,7 +53,10 @@ class Maai():
         force_download: bool = False,
         use_kv_cache: bool = True,
         local_model = None,
+        return_p_bins: bool = False,
     ):
+
+        self.return_p_bins = bool(return_p_bins)
 
         encoder_type = resolve_encoder_type(model_type)
 
@@ -526,12 +529,18 @@ class Maai():
                 "vap": lambda: {
                     "p_now": out['p_now'],
                     "p_future": out['p_future'],
-                    "vad": out['vad']
+                    "vad": out['vad'],
+                    "p_bins": out['p_bins'],
+                    "p_bins_now": out['p_bins_now'],
+                    "p_bins_future": out['p_bins_future'],
                 },
                 "vap_mc": lambda: {
                     "p_now": out['p_now'],
                     "p_future": out['p_future'],
-                    "vad": out['vad']
+                    "vad": out['vad'],
+                    "p_bins": out['p_bins'],
+                    "p_bins_now": out['p_bins_now'],
+                    "p_bins_future": out['p_bins_future'],
                 },
                 "vap_prompt": lambda: {
                     "p_now": out['p_now'],
@@ -564,7 +573,11 @@ class Maai():
             
             # Get mode-specific outputs
             if self.mode in mode_outputs:
-                result_dict.update(mode_outputs[self.mode]())
+                _out = mode_outputs[self.mode]()
+                if not self.return_p_bins and self.mode in ("vap", "vap_mc"):
+                    for _k in ("p_bins", "p_bins_now", "p_bins_future"):
+                        _out.pop(_k, None)
+                result_dict.update(_out)
             
             self.result_dict_queue.put(result_dict)
             
