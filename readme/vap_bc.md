@@ -74,12 +74,16 @@ The available parameters are summarized below.
 `frame_rate` specifies the number of samples processed per second by the VAP model.
 Please adjust this value according to your computing environment.
 
-| `lang` | `frame_rate` |
-| --- | --- |
-| jp | 5, 10, 20 |
-| en | 5, 10, 20 |
-| ch | 5, 10, 20 |
-| tri | 5, 10, 20 |
+| `lang` | `model_type` | `frame_rate` |
+| --- | --- | --- |
+| jp | normal | 5, 10, 20 |
+| jp | normal-ver2 | 12.5 |
+| en | normal | 5, 10, 20 |
+| en | normal-ver2 | 12.5 |
+| ch | normal | 5, 10, 20 |
+| ch | normal-ver2 | 12.5 |
+| tri | normal | 5, 10, 20 |
+| tri | normal-ver2 | 12.5 |
 
 </br>
 

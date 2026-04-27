@@ -162,6 +162,7 @@ You can find example implementations of MaAI models in the [example](example) di
 
 - Backchannel
     - [With 1 mic input](example/bc/bc_mic.py) 🎤
+    - [With 1 mic input (normal-ver2)](example/bc/bc_mic_ver2.py) 🎤
     - [With 1 mic input](example/bc_2type/bc_2type_mic.py) 🎤
 
 - Nodding
