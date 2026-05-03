@@ -14,7 +14,7 @@ import os
 # For debugging purposes, you can uncomment the following line to add the src directory to the path.
 # This allows you to import modules from the src directory without pip installing the package.
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../src/')))
+# sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../src/')))
 
 from maai import MaaiMultiple, MaaiInput, MaaiOutput
 
