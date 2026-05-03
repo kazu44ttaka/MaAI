@@ -9,8 +9,12 @@ import time
 import pickle
 import queue
 from . import util
-import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
+
+# matplotlib is only required by ``GuiBar`` and is lazy-imported there. Keeping
+# it out of the module top level lets users who only need ``ConsoleBar`` /
+# ``Tcp*`` import ``maai.output`` even when the matplotlib install is broken
+# (e.g., numpy/matplotlib ABI mismatch after a force-reinstall of another
+# dependency).
 
 DEFAULT_VAP_BIN_TIMES_SEC = [0.2, 0.4, 0.6, 0.8]
 
@@ -184,48 +188,146 @@ def _get_bar_for_value(key: str, value: Any, bar_length: int = 30, bar_type: str
 
 class ConsoleBar:
     """
-    maai.get_result()の内容をバーグラフで可視化するクラス
+    maai.get_result()の内容をバーグラフで可視化するクラス。
+
+    ``Maai`` の単一モデル結果と、``MaaiMultiple`` の「サブモデル名 ->
+    そのモデル固有の結果 dict」を含む結合結果の双方に対応する。
+    結合結果のときは、共通フィールド (``t``, ``x1``, ``x2``) を上部に
+    1 度だけ表示し、続けてサブモデルごとにヘッダ付きでセクションを描画する。
     """
     def __init__(self, bar_length: int = 30, bar_type: str = "normal"):
         self.bar_length = bar_length
         self.bar_type = bar_type
         self._first = True
 
+    # --------------------------------------------------------------
+    # entry point
+    # --------------------------------------------------------------
     def update(self, result: Dict[str, Any]):
         if self._first:
             sys.stdout.write("\x1b[2J")  # 初期クリア
             self._first = False
         sys.stdout.write("\x1b[H")  # カーソルを左上に移動
-        
-        # 時刻の表示
-        if 't' in result:
-            dt = time.localtime(result['t'])
-            ms = int((result['t'] - int(result['t'])) * 1000)
-            print(f"Time: {dt.tm_year:04d}/{dt.tm_mon:02d}/{dt.tm_mday:02d} {dt.tm_hour:02d}:{dt.tm_min:02d}:{dt.tm_sec:02d}.{ms:03d}")
-            print("-" * (self.bar_length + 30))
-        
+
+        sub_sections = self._collect_sub_sections(result)
+
+        # 時刻の表示（共通で 1 度だけ）
+        self._print_time(result)
+
+        if sub_sections:
+            # MaaiMultiple モード: 共通の x1/x2 を上部に 1 回だけ描画
+            self._print_shared_audio(result)
+            div_thick = "═" * (self.bar_length + 30)
+            div_thin = "─" * (self.bar_length + 30)
+            for label, sub_result in sub_sections:
+                print(div_thick)
+                # サブモデルが ``t`` / ``x1`` / ``x2`` を含む場合に備えて
+                # 念のため共通フィールドをマージ（無くても _render_section は動く）。
+                merged = dict(sub_result)
+                merged.setdefault("t", result.get("t"))
+                self._render_section(
+                    merged,
+                    header=f"▼ [{label}]",
+                    render_audio=False,
+                )
+            print(div_thick)
+        else:
+            # 従来どおりの単一モデル結果
+            self._render_section(result, header=None, render_audio=True)
+
+    # --------------------------------------------------------------
+    # helpers
+    # --------------------------------------------------------------
+    @staticmethod
+    def _collect_sub_sections(result: Dict[str, Any]) -> list[tuple[str, Dict[str, Any]]]:
+        """``MaaiMultiple`` の結合結果ならサブモデル一覧を返し、なければ空配列を返す。"""
+        return [(k, v) for k, v in result.items() if isinstance(v, dict)]
+
+    def _print_time(self, result: Dict[str, Any]) -> None:
+        if "t" not in result or result["t"] is None:
+            return
+        t = result["t"]
+        dt = time.localtime(t)
+        ms = int((t - int(t)) * 1000)
+        print(
+            f"Time: {dt.tm_year:04d}/{dt.tm_mon:02d}/{dt.tm_mday:02d} "
+            f"{dt.tm_hour:02d}:{dt.tm_min:02d}:{dt.tm_sec:02d}.{ms:03d}"
+        )
+        print("-" * (self.bar_length + 30))
+
+    def _print_shared_audio(self, result: Dict[str, Any]) -> None:
+        """``balance`` モードなら横並びで、それ以外なら 2 行に分けて x1/x2 を描画。"""
+        if "x1" not in result or "x2" not in result:
+            return
+        x1 = np.squeeze(np.array(result["x1"])).tolist()
+        x2 = np.squeeze(np.array(result["x2"])).tolist()
+        if self.bar_type == "balance":
+            bar1, val1 = _get_bar_for_value(
+                "x1", x1, self.bar_length // 2 - 1, "normal"
+            )
+            bar1 = bar1[::-1]
+            bar2, val2 = _get_bar_for_value(
+                "x2", x2, self.bar_length // 2 - 1, "normal"
+            )
+            print(
+                f"x1 │ x2{' ' * 8}: {bar1} │ {bar2} ({val1:.4f}, {val2:.4f})"
+            )
+        else:
+            for k, val in (("x1", x1), ("x2", x2)):
+                bar, value = _get_bar_for_value(k, val, self.bar_length, self.bar_type)
+                if isinstance(value, float):
+                    print(f"{k:15}: {bar} ({value:.3f})")
+                elif isinstance(value, list):
+                    print(
+                        f"{k:15}: {bar} ({', '.join(f'{v:.3f}' for v in value)})"
+                    )
+
+    # --------------------------------------------------------------
+    # per-section renderer (used both for single Maai and per sub-model)
+    # --------------------------------------------------------------
+    def _render_section(
+        self,
+        result: Dict[str, Any],
+        *,
+        header: str | None,
+        render_audio: bool,
+    ) -> None:
+        """単一モデル分の結果 dict を描画する。
+
+        ``render_audio=False`` の場合は ``x1`` / ``x2`` の表示は行わない
+        （MaaiMultiple では共通領域で 1 回だけ表示するため）。
+        """
+        if header is not None:
+            print(header)
+
         is_nod_para = _is_nod_para_style_repetitions(result)
 
-        # bar_typeがbalanceのとき、x1/x2を横並び表示（nod_para は後段で順序付き表示）
         if (
-            self.bar_type == "balance"
+            render_audio
+            and self.bar_type == "balance"
             and "x1" in result
             and "x2" in result
             and not is_nod_para
         ):
             x1 = np.squeeze(np.array(result["x1"])).tolist()
             x2 = np.squeeze(np.array(result["x2"])).tolist()
-            bar1, val1 = _get_bar_for_value("x1", x1, self.bar_length // 2 - 1, "normal")
+            bar1, val1 = _get_bar_for_value(
+                "x1", x1, self.bar_length // 2 - 1, "normal"
+            )
             bar1 = bar1[::-1]
-            bar2, val2 = _get_bar_for_value("x2", x2, self.bar_length // 2 - 1, "normal")
+            bar2, val2 = _get_bar_for_value(
+                "x2", x2, self.bar_length // 2 - 1, "normal"
+            )
             print(f"x1 │ x2{' ' * 8}: {bar1} │ {bar2} ({val1:.4f}, {val2:.4f})")
 
-        # vadがある場合はvad[0]をvad(x1)、vad[1]をvad(x2)として表示
-        if "vad" in result:
-            vad1 = result["vad"][0]
-            vad2 = result["vad"][1]
-            result["vad(x1)"] = vad1
-            result["vad(x2)"] = vad2
+        # vad → vad(x1)/vad(x2) 展開（呼び出し側 dict は変更しない）
+        local: Dict[str, Any] = dict(result)
+        if "vad" in local:
+            try:
+                local["vad(x1)"] = local["vad"][0]
+                local["vad(x2)"] = local["vad"][1]
+            except Exception:
+                pass
 
         skip_nod_para: set = set()
         if is_nod_para:
@@ -240,10 +342,14 @@ class ConsoleBar:
                 "nod_swing_up",
                 "nod_swing_up_pred",
             }
-            # 順: x1, x2 → p_nod → range → speed → repetitions（3本）→ swing（確率のみ）
-            if self.bar_type == "balance" and "x1" in result and "x2" in result:
-                x1 = np.squeeze(np.array(result["x1"])).tolist()
-                x2 = np.squeeze(np.array(result["x2"])).tolist()
+            if (
+                render_audio
+                and self.bar_type == "balance"
+                and "x1" in local
+                and "x2" in local
+            ):
+                x1 = np.squeeze(np.array(local["x1"])).tolist()
+                x2 = np.squeeze(np.array(local["x2"])).tolist()
                 bar1, val1 = _get_bar_for_value(
                     "x1", x1, self.bar_length // 2 - 1, "normal"
                 )
@@ -254,71 +360,73 @@ class ConsoleBar:
                 print(
                     f"x1 │ x2{' ' * 8}: {bar1} │ {bar2} ({val1:.4f}, {val2:.4f})"
                 )
-            else:
+            elif render_audio:
                 for k in ("x1", "x2"):
-                    if k not in result:
+                    if k not in local:
                         continue
-                    val = np.squeeze(np.array(result[k])).tolist()
+                    val = np.squeeze(np.array(local[k])).tolist()
                     bar, _value = _get_bar_for_value(
                         k, val, self.bar_length, self.bar_type
                     )
-                    if type(_value) is float:
+                    if isinstance(_value, float):
                         print(f"{k:15}: {bar} ({_value:.3f})")
-                    elif type(_value) is list:
+                    elif isinstance(_value, list):
                         print(
                             f"{k:15}: {bar} ({', '.join(f'{v:.3f}' for v in _value)})"
                         )
 
-            if "p_nod" in result:
-                v = float(result["p_nod"])
-                bar = _draw_bar(v, self.bar_length)
-                print(f"{'p_nod':15}: {bar} ({v:.3f})")
+            if "p_nod" in local:
+                v = float(local["p_nod"])
+                print(f"{'p_nod':15}: {_draw_bar(v, self.bar_length)} ({v:.3f})")
 
-            if "nod_range" in result:
-                rv = float(result["nod_range"])
+            if "nod_range" in local:
+                rv = float(local["nod_range"])
                 nv = _normalize_linear(rv, 0.035, 0.15)
-                bar = _draw_bar(nv, self.bar_length)
-                print(f"{'nod_range':15}: {bar} ({rv:.4f})")
+                print(f"{'nod_range':15}: {_draw_bar(nv, self.bar_length)} ({rv:.4f})")
 
-            if "nod_speed" in result:
-                sv = float(result["nod_speed"])
+            if "nod_speed" in local:
+                sv = float(local["nod_speed"])
                 nv = _normalize_linear(sv, 0.08, 0.25)
-                bar = _draw_bar(nv, self.bar_length)
-                print(f"{'nod_speed':15}: {bar} ({sv:.4f})")
+                print(f"{'nod_speed':15}: {_draw_bar(nv, self.bar_length)} ({sv:.4f})")
 
-            nc = result["nod_repetitions"]
+            nc = local["nod_repetitions"]
             labels = ("1", "2", "3+")
             for i, lab in enumerate(labels):
                 v = float(nc[i])
-                bar = _draw_bar(v, self.bar_length)
-                label = f"nod_rep {lab}"
-                print(f"{label:15}: {bar} ({v:.3f})")
+                print(
+                    f"{('nod_rep '+lab):15}: {_draw_bar(v, self.bar_length)} ({v:.3f})"
+                )
 
-            if "nod_repetitions_pred" in result:
-                rp = int(result["nod_repetitions_pred"])
+            if "nod_repetitions_pred" in local:
+                rp = int(local["nod_repetitions_pred"])
                 bar = _draw_rep_pred_incremental_bar(rp, 3, self.bar_length)
                 cls_labels = ("1", "2", "3+")
                 lab = cls_labels[rp] if 0 <= rp < len(cls_labels) else "?"
                 print(f"{'nod_rep_pred':15}: {bar} (class {lab})")
 
-            if "nod_swing_up" in result:
-                v = float(result["nod_swing_up"])
-                bar = _draw_bar(v, self.bar_length)
-                print(f"{'nod_swing_up':15}: {bar} ({v:.3f})")
+            if "nod_swing_up" in local:
+                v = float(local["nod_swing_up"])
+                print(f"{'nod_swing_up':15}: {_draw_bar(v, self.bar_length)} ({v:.3f})")
 
-            if "nod_swing_up_pred" in result:
-                sp = int(max(0, min(1, int(result["nod_swing_up_pred"]))))
-                bar = _draw_bar(float(sp), self.bar_length)
-                print(f"{'swing_pred':15}: {bar} ({sp} = off/on)")
-    
+            if "nod_swing_up_pred" in local:
+                sp = int(max(0, min(1, int(local["nod_swing_up_pred"]))))
+                print(
+                    f"{'swing_pred':15}: {_draw_bar(float(sp), self.bar_length)} ({sp} = off/on)"
+                )
+
         # 各キーを動的に処理
-        for key, value in result.items():
+        for key, value in local.items():
             if key in ("t", "vad", "bin_times"):
                 continue
             if key in skip_nod_para:
                 continue
-            # x1/x2は既に横並びで表示したのでスキップ
-            if self.bar_type == "balance" and key in ['x1', 'x2']:
+            # 共通領域で描画済みの x1/x2 はスキップ（または render_audio=False）
+            if not render_audio and key in ("x1", "x2"):
+                continue
+            if self.bar_type == "balance" and key in ("x1", "x2"):
+                continue
+            # ネストされた dict は MaaiMultiple のサブモデル領域で別途描画される
+            if isinstance(value, dict):
                 continue
             if not isinstance(value, (float, int)):
                 value = np.squeeze(np.array(value)).tolist()
@@ -331,7 +439,9 @@ class ConsoleBar:
                 for si, spk_bins in enumerate(value):
                     bins_str = ", ".join(f"{b:.3f}" for b in spk_bins)
                     bar = _draw_bar(float(np.mean(spk_bins)), self.bar_length)
-                    print(f"{'p_bins(spk'+str(si+1)+')':15}: {bar} [{bins_str}]")
+                    print(
+                        f"{'p_bins(spk'+str(si+1)+')':15}: {bar} [{bins_str}]"
+                    )
                 continue
             if (
                 key in ("p_bins_now", "p_bins_future")
@@ -339,14 +449,23 @@ class ConsoleBar:
                 and len(value) == 2
             ):
                 a, b = float(value[0]), float(value[1])
-                print(f"{key:15}: spk1={a:.4f}  spk2={b:.4f}  (ビン合計÷2、各話者 [0,1])")
+                print(
+                    f"{key:15}: spk1={a:.4f}  spk2={b:.4f}  "
+                    f"(ビン合計÷2、各話者 [0,1])"
+                )
                 continue
-            bar, _value = _get_bar_for_value(key, value, self.bar_length, self.bar_type)
-            if type(_value) is float:
+            bar, _value = _get_bar_for_value(
+                key, value, self.bar_length, self.bar_type
+            )
+            if isinstance(_value, float):
                 print(f"{key:15}: {bar} ({_value:.3f})")
-            elif type(_value) is list:
-                print(f"{key:15}: {bar} ({', '.join(f'{v:.3f}' for v in _value)})")
-        print("-" * (self.bar_length + 30))
+            elif isinstance(_value, list):
+                print(
+                    f"{key:15}: {bar} ({', '.join(f'{v:.3f}' for v in _value)})"
+                )
+        # 単一モデル時のみ末尾に区切り線を引く（multi 時は呼び出し側で線を引く）
+        if header is None:
+            print("-" * (self.bar_length + 30))
 
 class TcpReceiver:
     def __init__(self, ip, port, mode):
@@ -459,6 +578,13 @@ class TcpTransmitter:
 class GuiBar:
     """matplotlibを用いて結果をバーグラフでGUI表示するクラス"""
     def __init__(self, bar_type: str = "normal"):
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError as exc:
+            raise ImportError(
+                "GuiBar requires matplotlib. Install it with `pip install matplotlib`."
+            ) from exc
+
         self.bar_type = bar_type
         self.plt = plt
         self.fig, self.ax = plt.subplots()

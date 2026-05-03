@@ -381,29 +381,21 @@ class EncoderCPC(nn.Module):
         if hasattr(self.encoder, "gAR") and hasattr(self.encoder.gAR, "hidden"):
             self.encoder.gAR.hidden = None
 
-    def forward(self, waveform):
-        
+    def forward_shared(self, waveform):
         if waveform.ndim < 3:
             waveform = waveform.unsqueeze(1)  # channel dim
-
-        # Backwards using only the encoder encounters:
-        # ---------------------------------------------------
-        # RuntimeError: one of the variables needed for gradient computation
-        # has been modified by an inplace operation:
-        # [torch.FloatTensor [4, 256, 1000]], which is output 0 of ReluBackward0, is at version 1;
-        # expected version 0 instead. Hint: enable anomaly detection to find
-        # the operation that failed to compute its gradient, with
-        # torch.autograd.set_detect_anomaly(True).
-        # HOWEVER, if we feed through encoder.gAR we do not encounter that problem...
-
-        
         z = self.encoder.gEncoder(waveform)
         z = einops.rearrange(z, "b c n -> b n c")
         z = z[:, 1:-1, :]
         z = self.encoder.gAR(z)
-        z = self.downsample(z)
-        
         return z
+
+    def forward_specific(self, z):
+        return self.downsample(z)
+
+    def forward(self, waveform):
+        z = self.forward_shared(waveform)
+        return self.forward_specific(z)
 
     def hash_tensor(self, tensor):
         return hash(tuple(tensor.reshape(-1).tolist()))
@@ -908,17 +900,14 @@ class EncoderMimi(nn.Module):
             finalize_stream=True,
         )
 
-    def forward(
+    def forward_shared(
         self,
         waveform,
         resampling: bool = True,
-        only_feature_extractor: bool = False,
         streaming: bool = True,
         finalize_stream: bool = False,
         has_overlap_context: bool = True,
     ):
-        del only_feature_extractor
-
         self.model.eval()
         self._fix_mimi_padding_buffers()
 
@@ -931,17 +920,22 @@ class EncoderMimi(nn.Module):
         waveform = waveform.to(dtype=torch.float32)
 
         if not streaming:
-            return self._encode_offline(waveform, resampling=resampling)
+            input_num_samples = int(waveform.shape[-1])
+            if resampling:
+                waveform = self._resample_audio(waveform)
+            if waveform.shape[-1] == 0:
+                return waveform.new_zeros((waveform.shape[0], 0, self.output_dim)), input_num_samples
+            return self._encode_continuous_embeddings(waveform, streaming=False), input_num_samples
 
         overlap_context = self.context_samples if has_overlap_context else 0
         if overlap_context > 0:
             if waveform.shape[-1] <= overlap_context:
-                return waveform.new_zeros((waveform.shape[0], 0, self.output_dim))
+                return waveform.new_zeros((waveform.shape[0], 0, self.output_dim)), int(waveform.shape[-1])
             waveform = waveform[..., overlap_context:]
 
         input_num_samples = int(waveform.shape[-1])
         if input_num_samples == 0:
-            return waveform.new_zeros((waveform.shape[0], 0, self.output_dim))
+            return waveform.new_zeros((waveform.shape[0], 0, self.output_dim)), input_num_samples
 
         if resampling:
             waveform = self._resample_audio_streaming(
@@ -963,16 +957,50 @@ class EncoderMimi(nn.Module):
                 self._mimi_did_first_24k_leading_zeros = True
 
         if waveform.shape[-1] == 0:
-            return waveform.new_zeros((waveform.shape[0], 0, self.output_dim))
+            return waveform.new_zeros((waveform.shape[0], 0, self.output_dim)), input_num_samples
 
         embeddings = self._encode_continuous_embeddings(waveform, streaming=True)
+        return embeddings, input_num_samples
+
+    def forward_specific(
+        self,
+        embeddings: torch.Tensor,
+        input_num_samples: int,
+        streaming: bool = True,
+        finalize_stream: bool = False,
+    ):
         if embeddings.shape[1] == 0:
-            return waveform.new_zeros((waveform.shape[0], 0, self.output_dim))
+            return embeddings.new_zeros((embeddings.shape[0], 0, self.output_dim))
 
         return self._align_frame_rate(
             embeddings,
             input_num_samples=input_num_samples,
-            streaming=True,
+            streaming=streaming,
+            finalize_stream=finalize_stream,
+        )
+
+    def forward(
+        self,
+        waveform,
+        resampling: bool = True,
+        only_feature_extractor: bool = False,
+        streaming: bool = True,
+        finalize_stream: bool = False,
+        has_overlap_context: bool = True,
+    ):
+        del only_feature_extractor
+        
+        embeddings, input_num_samples = self.forward_shared(
+            waveform,
+            resampling=resampling,
+            streaming=streaming,
+            finalize_stream=finalize_stream,
+            has_overlap_context=has_overlap_context,
+        )
+        return self.forward_specific(
+            embeddings,
+            input_num_samples=input_num_samples,
+            streaming=streaming,
             finalize_stream=finalize_stream,
         )
 

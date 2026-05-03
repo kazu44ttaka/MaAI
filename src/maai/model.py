@@ -625,12 +625,487 @@ class Maai():
     def set_prompt_ch2(self, prompt: str):
         """
         Set the prompt text for speaker 2. This method is only available for the 'vap_prompt' mode.
-        
+
         Args:
             prompt (str): The prompt text for speaker 2.
         """
-        
+
         if self.mode != "vap_prompt":
             raise ValueError("This method is only available for the 'vap_prompt' mode.")
-        
+
         self.vap.set_prompt_ch2(prompt, self.device)
+
+
+class MaaiMultiple:
+    """
+    Run several Maai models in parallel that share a single audio encoder.
+
+    This is useful when you want to combine, for example, the turn-taking
+    (``vap``) model with the backchannel (``bc``) model and the nodding
+    (``nod``) model on the same input audio. A naive approach would build
+    one ``Maai`` instance per model and run the (relatively expensive) audio
+    encoder once for each instance. ``MaaiMultiple`` instead encodes the
+    audio once per frame and feeds the encoded features into every sub-model.
+
+    All sub-models must share the same encoder configuration:
+    ``model_type``, ``frame_rate``, ``context_len_sec``, ``device`` and the
+    ``mimi_*`` parameters. Per-model differences allowed in ``configs`` are
+    ``mode``, ``lang``, ``local_model``, ``return_p_bins`` and an optional
+    ``label`` used as the result key.
+
+    Each call to :meth:`get_result` returns a single ``dict`` whose top level
+    contains shared fields ``t``, ``x1``, ``x2`` plus one nested ``dict``
+    per sub-model keyed by its label (or its mode if no label is given).
+    """
+
+    CALC_PROCESS_TIME_INTERVAL = 100
+
+    # Modes whose ``encode_audio`` swaps audio1/audio2 before model forward.
+    _SWAP_MODES = {"bc", "bc_2type", "nod", "nod_para"}
+
+    def __init__(
+        self,
+        configs: list,
+        audio_ch1: Base,
+        audio_ch2: Base,
+        frame_rate: float = 10,
+        context_len_sec: int = 20,
+        device: str = "cpu",
+        cpc_model: str = os.path.expanduser("~/.cache/cpc/60k_epoch4-d0f474de.pt"),
+        model_type: str = "normal",
+        mimi_model_name: str = "kyutai/mimi",
+        use_mimi_onnx: bool = True,
+        mimi_onnx_precision: str = "fp32",
+        mimi_onnx_fp32_path: str | None = None,
+        mimi_onnx_fp32_meta_path: str | None = None,
+        mimi_onnx_int8_path: str | None = None,
+        mimi_onnx_int8_meta_path: str | None = None,
+        mimi_local_onnx_fp32_path: str | None = None,
+        mimi_local_onnx_fp32_meta_path: str | None = None,
+        mimi_local_onnx_int8_path: str | None = None,
+        mimi_local_onnx_int8_meta_path: str | None = None,
+        mimi_onnx_cpu_intra_threads: int | None = None,
+        mimi_onnx_cpu_inter_threads: int | None = None,
+        cache_dir: str = None,
+        force_download: bool = False,
+        use_kv_cache: bool = True,
+    ):
+        if not configs:
+            raise ValueError("MaaiMultiple requires at least one model config.")
+
+        shared_kwargs = dict(
+            audio_ch1=audio_ch1,
+            audio_ch2=audio_ch2,
+            frame_rate=frame_rate,
+            context_len_sec=context_len_sec,
+            device=device,
+            cpc_model=cpc_model,
+            model_type=model_type,
+            mimi_model_name=mimi_model_name,
+            use_mimi_onnx=use_mimi_onnx,
+            mimi_onnx_precision=mimi_onnx_precision,
+            mimi_onnx_fp32_path=mimi_onnx_fp32_path,
+            mimi_onnx_fp32_meta_path=mimi_onnx_fp32_meta_path,
+            mimi_onnx_int8_path=mimi_onnx_int8_path,
+            mimi_onnx_int8_meta_path=mimi_onnx_int8_meta_path,
+            mimi_local_onnx_fp32_path=mimi_local_onnx_fp32_path,
+            mimi_local_onnx_fp32_meta_path=mimi_local_onnx_fp32_meta_path,
+            mimi_local_onnx_int8_path=mimi_local_onnx_int8_path,
+            mimi_local_onnx_int8_meta_path=mimi_local_onnx_int8_meta_path,
+            mimi_onnx_cpu_intra_threads=mimi_onnx_cpu_intra_threads,
+            mimi_onnx_cpu_inter_threads=mimi_onnx_cpu_inter_threads,
+            cache_dir=cache_dir,
+            force_download=force_download,
+            use_kv_cache=use_kv_cache,
+        )
+
+        self.sub_maais: list[Maai] = []
+        self.labels: list[str] = []
+        seen_labels: set[str] = set()
+        for cfg in configs:
+            if "mode" not in cfg or "lang" not in cfg:
+                raise ValueError("Each entry of `configs` must contain 'mode' and 'lang'.")
+            label = cfg.get("label", cfg["mode"])
+            if label in seen_labels:
+                raise ValueError(
+                    f"Duplicate label '{label}'. Provide a unique 'label' field in each config."
+                )
+            seen_labels.add(label)
+            self.labels.append(label)
+            sub = Maai(
+                mode=cfg["mode"],
+                lang=cfg["lang"],
+                local_model=cfg.get("local_model"),
+                return_p_bins=cfg.get("return_p_bins", False),
+                **shared_kwargs,
+            )
+            self.sub_maais.append(sub)
+
+        primary = self.sub_maais[0]
+
+        # Mic configuration. Each Maai sub-instance subscribes a queue from
+        # the input source in __init__; we keep only the primary's queues and
+        # detach the rest so the audio source does not push frames into queues
+        # that nobody drains.
+        self.mic1 = audio_ch1
+        self.mic2 = audio_ch2
+        self._mic1_queue = primary._mic1_queue
+        self._mic2_queue = primary._mic2_queue
+        for sub in self.sub_maais[1:]:
+            self._unsubscribe(self.mic1, sub._mic1_queue)
+            self._unsubscribe(self.mic2, sub._mic2_queue)
+
+        # Shared frame parameters (validated via primary; all sub-Maais use
+        # the same encoder configuration so these match across instances).
+        self.device = primary.device
+        self.encoder_type = primary.encoder_type
+        self._use_mimi_onnx = primary._use_mimi_onnx
+        self.frame_rate = float(frame_rate)
+        self.audio_contenxt_lim_sec = context_len_sec
+        self.audio_context_len = primary.audio_context_len
+        self.sampling_rate = primary.sampling_rate
+        self.frame_contxt_padding = primary.frame_contxt_padding
+        self.audio_frame_size = primary.audio_frame_size
+        self.use_kv_cache = bool(use_kv_cache)
+
+        # Shared audio buffers and (when KV cache is disabled) shared encoded
+        # context. These are populated by the worker on each frame.
+        self.current_x1_audio = []
+        self.current_x2_audio = []
+        self.eA_full: list[torch.Tensor] = []
+        self.eB_full: list[torch.Tensor] = []
+
+        # One result queue, populated with a combined dict per frame.
+        self.result_dict_queue: queue.Queue = queue.Queue()
+
+        # Performance monitoring.
+        self.list_process_time_context: list[float] = []
+        self.last_interval_time = time.time()
+        self.process_time_abs = -1
+
+        # Threading.
+        self._stop_event = threading.Event()
+        self._worker_thread: threading.Thread | None = None
+
+        self.reset_runtime_state()
+
+    @staticmethod
+    def _unsubscribe(source: Base, q):
+        try:
+            with source._lock:
+                if q in source._subscriber_queues:
+                    source._subscriber_queues.remove(q)
+        except Exception:
+            pass
+
+    def reset_runtime_state(self):
+        self.current_x1_audio = []
+        self.current_x2_audio = []
+        self.eA_full = []
+        self.eB_full = []
+        self._skip_first_encoder_output = bool(
+            self.encoder_type == "mimi" and self._use_mimi_onnx
+        )
+
+        primary_vap = self.sub_maais[0].vap
+        for encoder_name in ["encoder1", "encoder2"]:
+            encoder = getattr(primary_vap, encoder_name, None)
+            if encoder is not None and hasattr(encoder, "reset_streaming_state"):
+                encoder.reset_streaming_state()
+
+        for sub in self.sub_maais:
+            sub.vap_cache = None
+            sub.e1_full = []
+            sub.e2_full = []
+
+    def worker(self):
+        self._mic1_queue.queue.clear()
+        self._mic2_queue.queue.clear()
+
+        while not self._stop_event.is_set():
+            x1 = self.mic1.get_audio_data(self._mic1_queue)
+            x2 = self.mic2.get_audio_data(self._mic2_queue)
+
+            if self._stop_event.is_set() or x1 is None or x2 is None:
+                break
+
+            self.process(x1, x2)
+
+            if self._mic1_queue.qsize() > 100:
+                self._mic1_queue.queue.clear()
+                print("[Warning] Audio queue (channel 1) overflow detected. Clearing audio queues.")
+            if self._mic2_queue.qsize() > 100:
+                self._mic2_queue.queue.clear()
+                print("[Warning] Audio queue (channel 2) overflow detected. Clearing audio queues.")
+
+    def start(self):
+        self.reset_runtime_state()
+
+        self.mic1.start()
+        self.mic2.start()
+        self._stop_event.clear()
+        self._worker_thread = threading.Thread(target=self.worker, daemon=True)
+        self._worker_thread.start()
+
+        self._mic1_queue.queue.clear()
+        self._mic2_queue.queue.clear()
+
+    def stop(self, wait: bool = True, timeout: float = 2.0):
+        self._stop_event.set()
+        try:
+            self._mic1_queue.put(None)
+            self._mic2_queue.put(None)
+        except Exception:
+            pass
+        if wait and self._worker_thread is not None and self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=timeout)
+
+        try:
+            self._mic1_queue.queue.clear()
+            self._mic2_queue.queue.clear()
+        except Exception:
+            pass
+
+        self.reset_runtime_state()
+
+    def _trim_audio_buffers(self):
+        if self.frame_contxt_padding > 0:
+            self.current_x1_audio = self.current_x1_audio[-self.frame_contxt_padding:].copy()
+            self.current_x2_audio = self.current_x2_audio[-self.frame_contxt_padding:].copy()
+        else:
+            self.current_x1_audio = np.empty(0, dtype=np.float32)
+            self.current_x2_audio = np.empty(0, dtype=np.float32)
+
+    @staticmethod
+    def _trim_kv_cache(cache: dict, ctx_len: int) -> dict:
+        new_cache = {}
+        for key, (k_list, v_list) in cache.items():
+            new_k_list = []
+            new_v_list = []
+            for t in k_list:
+                if isinstance(t, torch.Tensor) and t.dim() >= 3:
+                    new_k_list.append(t[..., -(ctx_len - 1):, :])
+                else:
+                    new_k_list.append(t)
+            for t in v_list:
+                if isinstance(t, torch.Tensor) and t.dim() >= 3:
+                    new_v_list.append(t[..., -(ctx_len - 1):, :])
+                else:
+                    new_v_list.append(t)
+            new_cache[key] = (new_k_list, new_v_list)
+        return new_cache
+
+    def process(self, x1, x2):
+        time_start = time.time()
+
+        if len(self.current_x1_audio) == 0:
+            self.current_x1_audio = np.zeros(self.frame_contxt_padding, dtype=np.float32)
+        if len(self.current_x2_audio) == 0:
+            self.current_x2_audio = np.zeros(self.frame_contxt_padding, dtype=np.float32)
+
+        self.current_x1_audio = np.concatenate([self.current_x1_audio, x1])
+        self.current_x2_audio = np.concatenate([self.current_x2_audio, x2])
+
+        if len(self.current_x1_audio) < self.audio_frame_size:
+            return
+
+        x1_proc = self.current_x1_audio
+        x2_proc = self.current_x2_audio
+        x1_dist = x1_proc[self.frame_contxt_padding:]
+        x2_dist = x2_proc[self.frame_contxt_padding:]
+
+        with torch.inference_mode():
+            x1_t = torch.from_numpy(x1_proc).float().unsqueeze(0).unsqueeze(0)
+            x2_t = torch.from_numpy(x2_proc).float().unsqueeze(0).unsqueeze(0)
+            if self.device != "cpu":
+                x1_t = x1_t.to(self.device, non_blocking=True)
+                x2_t = x2_t.to(self.device, non_blocking=True)
+
+            # Shared encoding step. We extract the shared features (before model-specific downsample)
+            # using the primary model's encoder. The state/KV cache is maintained here.
+            primary_vap = self.sub_maais[0].vap
+            
+            if self.encoder_type == "mimi":
+                eA_shared, input_num_samples_A = primary_vap.encoder1.forward_shared(x1_t)
+                eB_shared, input_num_samples_B = primary_vap.encoder2.forward_shared(x2_t)
+            else:
+                eA_shared = primary_vap.encoder1.forward_shared(x1_t)
+                eB_shared = primary_vap.encoder2.forward_shared(x2_t)
+
+            if eA_shared.shape[1] == 0 or eB_shared.shape[1] == 0:
+                self._trim_audio_buffers()
+                print("[Warning] No audio features extracted. Skipping this frame.")
+                return
+
+            # Skip the first Mimi encoder output to avoid the startup-only
+            # mismatch between ONNX and PyTorch cache warmup behavior, just
+            # like Maai.process does.
+            if self._skip_first_encoder_output:
+                self._skip_first_encoder_output = False
+                self.process_time_abs = time.time()
+                self._trim_audio_buffers()
+                return
+
+            # If KV cache is disabled, maintain a shared rolling context of
+            # encoded features and feed each sub-model with the full window.
+            if not self.use_kv_cache:
+                self.eA_full.append(eA_shared)
+                self.eB_full.append(eB_shared)
+                if len(self.eA_full) > self.audio_context_len:
+                    self.eA_full.pop(0)
+                if len(self.eB_full) > self.audio_context_len:
+                    self.eB_full.pop(0)
+                eA_in = torch.cat(self.eA_full, dim=1)
+                eB_in = torch.cat(self.eB_full, dim=1)
+            else:
+                eA_in = eA_shared
+                eB_in = eB_shared
+
+            results_combined: dict = {
+                "t": time.time(),
+                "x1": x1_dist.copy(),
+                "x2": x2_dist.copy(),
+            }
+
+            for label, sub in zip(self.labels, self.sub_maais):
+                # Reproduce the per-mode swap that lives in each model's
+                # encode_audio: bc/bc_2type/nod/nod_para want the swapped
+                # (user, system) ordering, the others want the natural one.
+                if sub.mode in self._SWAP_MODES:
+                    e1_shared, e2_shared = eB_in, eA_in
+                else:
+                    e1_shared, e2_shared = eA_in, eB_in
+
+                # Apply the model-specific downsampling layer
+                if self.encoder_type == "mimi":
+                    if sub.mode in self._SWAP_MODES:
+                        n1, n2 = input_num_samples_B, input_num_samples_A
+                    else:
+                        n1, n2 = input_num_samples_A, input_num_samples_B
+                    e1 = sub.vap.encoder1.forward_specific(e1_shared, input_num_samples=n1)
+                    e2 = sub.vap.encoder2.forward_specific(e2_shared, input_num_samples=n2)
+                else:
+                    e1 = sub.vap.encoder1.forward_specific(e1_shared)
+                    e2 = sub.vap.encoder2.forward_specific(e2_shared)
+
+                # Apply each sub-model's decrease_dimension here (most models
+                # apply it inside encode_audio). nod_para applies projections
+                # internally inside its forward, so leave it alone.
+                if sub.mode != "nod_para" and hasattr(sub.vap, "decrease_dimension"):
+                    e1 = sub.vap.decrease_dimension(e1)
+                    e2 = sub.vap.decrease_dimension(e2)
+
+                if self.use_kv_cache:
+                    out, sub.vap_cache = sub.vap.forward(e1, e2, cache=sub.vap_cache)
+                    if sub.vap_cache is not None:
+                        sub.vap_cache = self._trim_kv_cache(sub.vap_cache, self.audio_context_len)
+                else:
+                    out, _ = sub.vap.forward(e1, e2, cache=None)
+
+                results_combined[label] = self._extract_outputs(
+                    sub.mode, out, sub.return_p_bins
+                )
+
+            self.result_dict_queue.put(results_combined)
+
+            time_process = time.time() - time_start
+            self.list_process_time_context.append(time_process)
+
+            if len(self.list_process_time_context) > self.CALC_PROCESS_TIME_INTERVAL:
+                ave_proc_time = np.mean(self.list_process_time_context)
+                num_process_frame = (
+                    len(self.list_process_time_context)
+                    / (time.time() - self.last_interval_time)
+                )
+                self.last_interval_time = time.time()
+
+                modes = ",".join(self.labels)
+                msg = (
+                    f"[multi:{modes}] Average processing time: {ave_proc_time:.5f} [sec], "
+                    f"#process/sec: {num_process_frame:.3f}"
+                )
+                if self.encoder_type == "mimi":
+                    msg += f", chunk_samples: {self.audio_frame_size}"
+                print(msg)
+                self.list_process_time_context.clear()
+
+            self.process_time_abs = time.time()
+
+        self._trim_audio_buffers()
+
+    @staticmethod
+    def _extract_outputs(mode: str, out: dict, return_p_bins: bool) -> dict:
+        if mode in ("vap", "vap_mc"):
+            d = {
+                "p_now": out["p_now"],
+                "p_future": out["p_future"],
+                "vad": out["vad"],
+                "p_bins": out["p_bins"],
+                "p_bins_now": out["p_bins_now"],
+                "p_bins_future": out["p_bins_future"],
+            }
+            if not return_p_bins:
+                for k in ("p_bins", "p_bins_now", "p_bins_future"):
+                    d.pop(k, None)
+            return d
+        if mode == "vap_prompt":
+            return {
+                "p_now": out["p_now"],
+                "p_future": out["p_future"],
+                "vad": out["vad"],
+            }
+        if mode == "bc":
+            return {"p_bc": out["p_bc"]}
+        if mode == "bc_2type":
+            return {
+                "p_bc_react": out["p_bc_react"],
+                "p_bc_emo": out["p_bc_emo"],
+            }
+        if mode == "nod":
+            return {
+                "p_bc": out["p_bc"],
+                "p_nod_short": out["p_nod_short"],
+                "p_nod_long": out["p_nod_long"],
+                "p_nod_long_p": out["p_nod_long_p"],
+            }
+        if mode == "nod_para":
+            return {
+                "p_nod": out["p_nod"],
+                "nod_repetitions": out["nod_repetitions"],
+                "nod_repetitions_pred": out["nod_repetitions_pred"],
+                "nod_range": out["nod_range"],
+                "nod_speed": out["nod_speed"],
+                "nod_swing_up": out["nod_swing_up"],
+                "nod_swing_up_pred": out["nod_swing_up_pred"],
+            }
+        return {}
+
+    def get_result(self):
+        return self.result_dict_queue.get()
+
+    def get_sub_maai(self, label: str) -> Maai:
+        """Return the underlying ``Maai`` instance registered under ``label``."""
+        for lbl, sub in zip(self.labels, self.sub_maais):
+            if lbl == label:
+                return sub
+        raise KeyError(f"No sub-model with label '{label}'. Available: {self.labels}")
+
+    def set_prompt_ch1(self, prompt: str, label: str | None = None):
+        """Set channel-1 prompt on every ``vap_prompt`` sub-model (or only on ``label``)."""
+        applied = False
+        for lbl, sub in zip(self.labels, self.sub_maais):
+            if sub.mode == "vap_prompt" and (label is None or lbl == label):
+                sub.set_prompt_ch1(prompt)
+                applied = True
+        if label is not None and not applied:
+            raise ValueError(f"No 'vap_prompt' sub-model found for label '{label}'.")
+
+    def set_prompt_ch2(self, prompt: str, label: str | None = None):
+        """Set channel-2 prompt on every ``vap_prompt`` sub-model (or only on ``label``)."""
+        applied = False
+        for lbl, sub in zip(self.labels, self.sub_maais):
+            if sub.mode == "vap_prompt" and (label is None or lbl == label):
+                sub.set_prompt_ch2(prompt)
+                applied = True
+        if label is not None and not applied:
+            raise ValueError(f"No 'vap_prompt' sub-model found for label '{label}'.")

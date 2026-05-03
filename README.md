@@ -116,6 +116,14 @@ Nodding refers to the up-and-down movement of the head and is closely related to
 - [VAP-based Nodding Prediction Model](readme/vap_nod.md)
 - [VAP-based Nodding Prediction Model with Kinematic Parameter](readme/vap_nod_para.md)
 
+### Running Multiple Models with a Shared Encoder
+
+When several Maai models need to run on the same audio stream, the
+`MaaiMultiple` class shares a single audio encoder across all of them so
+the (relatively expensive) encoder runs only once per audio frame.
+
+- [MaaiMultiple - Sharing the Audio Encoder Across Multiple Models](readme/multiple.md)
+
 <br>
 
 ## 🎚️ Input / Output
@@ -170,6 +178,9 @@ You can find example implementations of MaAI models in the [example](example) di
         - [With 1 mic input](example/nod/nod_mic.py) 🎤
     - Prediction of kinematic parameter of nodding
         - [With 1 mic input](example/nod/nod_para_mic.py) 🎤
+
+- Multiple models sharing a single audio encoder
+    - [VAP + BC + Nod with 1 mic input](example/multiple/multi_mic.py) 🎤
 
 - Output
     - [Console Dynamic Output](example/output/vap_2wav_ConsoleBar.py) 📊
@@ -249,6 +260,29 @@ https://aclanthology.org/2025.naacl-long.367/<br>
     url = {https://aclanthology.org/2025.naacl-long.367/},
 }
 ```
+
+<br>
+
+## 🛠️ Troubleshooting
+
+### `model_type="normal-ver2"` fails with an `onnxruntime` DLL load error on Windows + Anaconda
+
+When using `model_type="normal-ver2"` on a Windows machine with Anaconda, importing `onnxruntime` (used by the Mimi encoder) may fail with:
+
+```
+ImportError: DLL load failed while importing onnxruntime_pybind11_state:
+A dynamic link library (DLL) initialization routine failed.
+```
+
+(On a Japanese-locale Windows the second line is shown as `ダイナミック リンク ライブラリ (DLL) 初期化ルーチンの実行に失敗しました。`)
+
+This is caused by the Visual C++ runtime not being available in the conda environment. Installing the runtime via conda-forge resolves it:
+
+```bash
+conda install -c conda-forge vs2015_runtime
+```
+
+After this, `model_type="normal-ver2"` (and `MaaiMultiple` with the same setting) should work without modification.
 
 <br>
 
