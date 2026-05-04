@@ -35,7 +35,7 @@ README: <a href="vap.md">English </a> | <a href="vap_JP.md">Japanese (日本語)
 本モデルは以下の日本語データセットで学習されています：
 - [オンライン会話データセット](https://www.arxiv.org/abs/2506.21191)
 
-また、このモデルはMITランセンスで公開されています。
+また、このモデルはMITライセンスで公開されています。
 
 </br>
 
@@ -52,7 +52,7 @@ README: <a href="vap.md">English </a> | <a href="vap_JP.md">Japanese (日本語)
 本モデルは以下の英語データセットで学習されています：
 - オンライン会話データセット
 
-また、このモデルはMITランセンスで公開されています。
+また、このモデルはMITライセンスで公開されています。
 
 </br>
 
@@ -69,7 +69,7 @@ README: <a href="vap.md">English </a> | <a href="vap_JP.md">Japanese (日本語)
 本モデルは以下の中国語データセットで学習されています：
 - オンライン会話データセット
 
-また、このモデルはMITランセンスで公開されています。
+また、このモデルはMITライセンスで公開されています。
 
 </br>
 
@@ -89,7 +89,7 @@ README: <a href="vap.md">English </a> | <a href="vap_JP.md">Japanese (日本語)
 本モデルは以下の3言語データセットで学習されています：
 - [オンライン会話データセット](https://www.arxiv.org/abs/2506.21191)
 
-また、このモデルはMITランセンスで公開されています。
+また、このモデルはMITライセンスで公開されています。
 
 </br>
 
