@@ -15,6 +15,7 @@ from .util import download_continuous_mimi_onnx
 
 import time
 import copy
+import threading
 
 
 def _hf_past_kv_per_layer_tuples(
@@ -167,6 +168,7 @@ class _CausalStreamingResampler(nn.Module):
         super().__init__()
         self.orig_freq = float(orig_freq)
         self.new_freq = float(new_freq)
+        self._lock = threading.Lock()
         self.reset()
 
     @property
@@ -174,7 +176,8 @@ class _CausalStreamingResampler(nn.Module):
         return self.orig_freq / self.new_freq
 
     def reset(self) -> None:
-        self.state = _StreamingResamplerState()
+        with self._lock:
+            self.state = _StreamingResamplerState()
 
     def _empty_like_prev(self) -> torch.Tensor:
         if self.state.prev is None:
@@ -182,83 +185,85 @@ class _CausalStreamingResampler(nn.Module):
         return self.state.prev.unsqueeze(-1)[:, :, :0]
 
     def process(self, x: torch.Tensor) -> torch.Tensor:
-        if x.ndim != 3:
-            raise ValueError(f"Expected x as [B, C, T], got {tuple(x.shape)}")
+        with self._lock:
+            if x.ndim != 3:
+                raise ValueError(f"Expected x as [B, C, T], got {tuple(x.shape)}")
 
-        batch_size, channels, frames = x.shape
-        if frames == 0:
-            return x.new_zeros((batch_size, channels, 0))
+            batch_size, channels, frames = x.shape
+            if frames == 0:
+                return x.new_zeros((batch_size, channels, 0))
 
-        if (
-            self.state.prev is None
-            or self.state.prev.ndim != 2
-            or self.state.prev.shape[0] != batch_size
-            or self.state.prev.shape[1] != channels
-            or self.state.prev.device != x.device
-            or self.state.prev.dtype != x.dtype
-        ):
-            self.state.prev = x[:, :, 0].detach()
-            self.state.next_t_in_samples = float(self.state.in_total_samples)
+            if (
+                self.state.prev is None
+                or self.state.prev.ndim != 2
+                or self.state.prev.shape[0] != batch_size
+                or self.state.prev.shape[1] != channels
+                or self.state.prev.device != x.device
+                or self.state.prev.dtype != x.dtype
+            ):
+                self.state.prev = x[:, :, 0].detach()
+                self.state.next_t_in_samples = float(self.state.in_total_samples)
 
-        in_start = self.state.in_total_samples
-        in_end = in_start + frames - 1
+            in_start = self.state.in_total_samples
+            in_end = in_start + frames - 1
 
-        if self.state.next_t_in_samples > in_end:
+            if self.state.next_t_in_samples > in_end:
+                self.state.in_total_samples += int(frames)
+                self.state.prev = x[:, :, -1].detach()
+                return x.new_zeros((batch_size, channels, 0))
+
+            step = self.step_in
+            n_out = int(np.floor((in_end - self.state.next_t_in_samples) / step) + 1)
+            if n_out <= 0:
+                self.state.in_total_samples += int(frames)
+                self.state.prev = x[:, :, -1].detach()
+                return x.new_zeros((batch_size, channels, 0))
+
+            t = (
+                torch.arange(n_out, device=x.device, dtype=torch.float32) * float(step)
+                + float(self.state.next_t_in_samples)
+            )
+            t_floor = torch.floor(t)
+            frac = (t - t_floor).to(dtype=x.dtype)
+            t_floor = t_floor.to(dtype=torch.long)
+
+            local_i0 = t_floor - int(in_start)
+            idx0 = (local_i0 + 1).clamp(min=0, max=frames).to(dtype=torch.long)
+            idx1 = (idx0 + 1).clamp(max=frames).to(dtype=torch.long)
+
+            x_ext = torch.cat([self.state.prev.unsqueeze(-1), x], dim=-1)
+            gather0 = idx0.view(1, 1, -1).expand(batch_size, channels, -1)
+            gather1 = idx1.view(1, 1, -1).expand(batch_size, channels, -1)
+            x0 = torch.gather(x_ext, dim=-1, index=gather0)
+            x1 = torch.gather(x_ext, dim=-1, index=gather1)
+
+            frac_bc = frac.view(1, 1, -1)
+            y = (1.0 - frac_bc) * x0 + frac_bc * x1
+
+            self.state.next_t_in_samples = float(self.state.next_t_in_samples + n_out * step)
             self.state.in_total_samples += int(frames)
+            self.state.out_total_samples += int(n_out)
             self.state.prev = x[:, :, -1].detach()
-            return x.new_zeros((batch_size, channels, 0))
-
-        step = self.step_in
-        n_out = int(np.floor((in_end - self.state.next_t_in_samples) / step) + 1)
-        if n_out <= 0:
-            self.state.in_total_samples += int(frames)
-            self.state.prev = x[:, :, -1].detach()
-            return x.new_zeros((batch_size, channels, 0))
-
-        t = (
-            torch.arange(n_out, device=x.device, dtype=torch.float32) * float(step)
-            + float(self.state.next_t_in_samples)
-        )
-        t_floor = torch.floor(t)
-        frac = (t - t_floor).to(dtype=x.dtype)
-        t_floor = t_floor.to(dtype=torch.long)
-
-        local_i0 = t_floor - int(in_start)
-        idx0 = (local_i0 + 1).clamp(min=0, max=frames).to(dtype=torch.long)
-        idx1 = (idx0 + 1).clamp(max=frames).to(dtype=torch.long)
-
-        x_ext = torch.cat([self.state.prev.unsqueeze(-1), x], dim=-1)
-        gather0 = idx0.view(1, 1, -1).expand(batch_size, channels, -1)
-        gather1 = idx1.view(1, 1, -1).expand(batch_size, channels, -1)
-        x0 = torch.gather(x_ext, dim=-1, index=gather0)
-        x1 = torch.gather(x_ext, dim=-1, index=gather1)
-
-        frac_bc = frac.view(1, 1, -1)
-        y = (1.0 - frac_bc) * x0 + frac_bc * x1
-
-        self.state.next_t_in_samples = float(self.state.next_t_in_samples + n_out * step)
-        self.state.in_total_samples += int(frames)
-        self.state.out_total_samples += int(n_out)
-        self.state.prev = x[:, :, -1].detach()
-        return y
+            return y
 
     def flush(self) -> torch.Tensor:
-        if self.state.prev is None:
-            return self._empty_like_prev()
+        with self._lock:
+            if self.state.prev is None:
+                return self._empty_like_prev()
 
-        out_total_target = int(
-            round(self.state.in_total_samples * (self.new_freq / self.orig_freq))
-        )
-        n_out = out_total_target - self.state.out_total_samples
-        if n_out <= 0:
-            return self._empty_like_prev()
+            out_total_target = int(
+                round(self.state.in_total_samples * (self.new_freq / self.orig_freq))
+            )
+            n_out = out_total_target - self.state.out_total_samples
+            if n_out <= 0:
+                return self._empty_like_prev()
 
-        y = self.state.prev.unsqueeze(-1).expand(-1, -1, n_out).contiguous()
-        self.state.next_t_in_samples = float(
-            self.state.next_t_in_samples + n_out * self.step_in
-        )
-        self.state.out_total_samples = int(out_total_target)
-        return y
+            y = self.state.prev.unsqueeze(-1).expand(-1, -1, n_out).contiguous()
+            self.state.next_t_in_samples = float(
+                self.state.next_t_in_samples + n_out * self.step_in
+            )
+            self.state.out_total_samples = int(out_total_target)
+            return y
 
 def mimi_sliding_cache_len(frame_hz_mimi: float) -> int:
     """KV length for Mimi encoder_transformer: ~20s at Mimi frame rate, VAP-aligned (-1 frame)."""

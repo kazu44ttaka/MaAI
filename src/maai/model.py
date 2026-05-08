@@ -360,12 +360,11 @@ class Maai():
         self.mic1.start()
         self.mic2.start()
         self._stop_event.clear()
-        self._worker_thread = threading.Thread(target=self.worker, daemon=True)
-        self._worker_thread.start()
-
-        # Queueを空にする
+        # Queue を空にしてからスレッド起動（スレッドに古いデータが届かないよう先にクリア）
         self._mic1_queue.queue.clear()
         self._mic2_queue.queue.clear()
+        self._worker_thread = threading.Thread(target=self.worker, daemon=True)
+        self._worker_thread.start()
     
     def stop(self, wait: bool = True, timeout: float = 2.0):
         """
@@ -844,11 +843,11 @@ class MaaiMultiple:
         self.mic1.start()
         self.mic2.start()
         self._stop_event.clear()
-        self._worker_thread = threading.Thread(target=self.worker, daemon=True)
-        self._worker_thread.start()
-
+        # Queue を空にしてからスレッド起動（スレッドに古いデータが届かないよう先にクリア）
         self._mic1_queue.queue.clear()
         self._mic2_queue.queue.clear()
+        self._worker_thread = threading.Thread(target=self.worker, daemon=True)
+        self._worker_thread.start()
 
     def stop(self, wait: bool = True, timeout: float = 2.0):
         self._stop_event.set()
